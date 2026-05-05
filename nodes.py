@@ -76,6 +76,9 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
     # Apply IP-Adapter only within [start_at, end_at] step range
     ip_result = torch.zeros_like(text_result)
     if start_at <= current_sigma <= end_at:
+        # Expand image_tokens to match batch size (CFG uses B=2)
+        if image_tokens.shape[0] < B:
+            image_tokens = image_tokens.expand(B, -1, -1)
         ip_out = ip_adapter.forward_block(block_idx, normed_flat, image_tokens)
         ip_out = rearrange(ip_out, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
         ip_result = weight * ip_out
