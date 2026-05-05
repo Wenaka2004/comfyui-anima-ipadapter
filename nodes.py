@@ -12,6 +12,7 @@ from .ip_adapter_model import IPAdapter
 # ─── IP-Adapter Injection ────────────────────────────────────────────
 
 def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
+                            weight, start_at, end_at, current_sigma,
                             x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
     """Block.forward with IP-Adapter cross-attention injection.
 
@@ -64,8 +65,12 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
         "b (t h w) d -> b t h w d", t=T, h=H, w=W,
     )
 
-    ip_result = ip_adapter.forward_block(block_idx, normed_flat, image_tokens)
-    ip_result = rearrange(ip_result, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
+    # Apply IP-Adapter only within [start_at, end_at] step range
+    ip_result = torch.zeros_like(text_result)
+    if start_at <= current_sigma <= end_at:
+        ip_out = ip_adapter.forward_block(block_idx, normed_flat, image_tokens)
+        ip_out = rearrange(ip_out, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
+        ip_result = weight * ip_out
 
     gate = rearrange(g2, "b t d -> b t 1 1 d")
     x_B_T_H_W_D = gate.to(residual_dtype) * (text_result.to(residual_dtype) + ip_result.to(residual_dtype)) + x_B_T_H_W_D
@@ -81,9 +86,12 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
 class IPAdapterHook:
     """Hooks into Anima's DiT to inject IP-Adapter during sampling."""
 
-    def __init__(self, ip_adapter, image_tokens):
+    def __init__(self, ip_adapter, image_tokens, weight, start_at, end_at):
         self.ip_adapter = ip_adapter
         self.image_tokens = image_tokens
+        self.weight = weight
+        self.start_at = start_at
+        self.end_at = end_at
         self._patches = []
 
     def attach(self, model_patcher):
@@ -94,8 +102,22 @@ class IPAdapterHook:
 
             def make_forward(of, idx):
                 def new_forward(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
+                    # Derive current progress from timestep embedding
+                    # emb_B_T_D contains the pooled timestep signal; extract sigma
+                    transformer_options = kwargs.get("transformer_options", {})
+                    current_sigma = transformer_options.get("sigmas", None)
+                    if current_sigma is not None:
+                        # sigma is per-batch, take first element as proxy
+                        if hasattr(current_sigma, 'item'):
+                            current_sigma = current_sigma.item()
+                        elif hasattr(current_sigma, '__len__'):
+                            current_sigma = float(current_sigma[0]) if len(current_sigma) > 0 else 1.0
+                    else:
+                        current_sigma = 1.0  # fallback: always apply
+
                     return _block_forward_with_ip(
                         block, idx, self.ip_adapter, self.image_tokens,
+                        self.weight, self.start_at, self.end_at, current_sigma,
                         x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs,
                     )
                 return new_forward
@@ -189,15 +211,10 @@ class AnimaIPAdapterApply:
             if image_emb.ndim == 2:
                 image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
             ipadapter = ipadapter.to(dtype=dtype, device=device)
-            image_tokens = ipadapter.resample(image_emb.to(dtype))  # [1, 16, 1024]
+            image_tokens = ipadapter.resample(image_emb.to(dtype=dtype, device=device))  # [1, 16, 1024]
 
-        # Scale ip_scales by weight
-        if weight != 1.0:
-            for s in ipadapter.ip_scales:
-                s.data.mul_(weight)
-
-        # Hook into model
-        hook = IPAdapterHook(ipadapter, image_tokens)
+        # Hook into model — weight/start_at/end_at passed to hook, NOT modifying ip_scales
+        hook = IPAdapterHook(ipadapter, image_tokens, weight, start_at, end_at)
         hook.attach(model)
 
         # Store hook for cleanup
@@ -253,16 +270,14 @@ class AnimaQwenVLLoader:
         if Path(model_path).exists():
             model_path = str(Path(model_path).resolve())
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         if dtype == "bf16":
             model = Qwen3VLForConditionalGeneration.from_pretrained(
-                model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
-            ).to(device).eval()
+                model_path, dtype=torch.bfloat16, trust_remote_code=True,
+            ).cuda().eval()
         elif dtype == "fp8":
             model = Qwen3VLForConditionalGeneration.from_pretrained(
-                model_path, torch_dtype=torch.float8_e4m3fn, trust_remote_code=True,
-            ).to(device).eval()
+                model_path, dtype=torch.float8_e4m3fn, trust_remote_code=True,
+            ).cuda().eval()
         elif dtype == "int8":
             quant_config = BitsAndBytesConfig(load_in_8bit=True)
             model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -304,7 +319,7 @@ class AnimaQwenVLEncodeImage:
 
         model = qwen_vl_model["model"]
         processor = qwen_vl_model["processor"]
-        device = model.device
+        device = next(model.parameters()).device
 
         # ComfyUI IMAGE: [B, H, W, 3] float [0,1] → PIL
         if image.ndim == 4:
