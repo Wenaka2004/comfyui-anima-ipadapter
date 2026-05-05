@@ -225,8 +225,34 @@ class AnimaImageEmbLoader:
         return (emb,)
 
 
-class AnimaIPAdapterEncodeImage:
-    """Compute Qwen3-VL embedding from a reference image (requires Qwen3-VL model)."""
+class AnimaQwenVLLoader:
+    """Load Qwen3-VL-Embedding-2B for image embedding extraction."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_path": ("STRING", {"default": "Qwen/Qwen3-VL-Embedding-2B", "tooltip": "HuggingFace model ID or local path to Qwen3-VL-Embedding-2B"}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN_VL_MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "anima_ipadapter"
+
+    def load(self, model_path):
+        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        ).to(device).eval()
+        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        return ({"model": model, "processor": processor},)
+
+
+class AnimaQwenVLEncodeImage:
+    """Extract 1024-dim Qwen3-VL embedding from a reference image."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -241,24 +267,69 @@ class AnimaIPAdapterEncodeImage:
     FUNCTION = "encode"
     CATEGORY = "anima_ipadapter"
 
+    @staticmethod
+    def _pooling_last(hidden_state, attention_mask):
+        """Pool by taking the last token position indicated by attention_mask."""
+        flipped = attention_mask.flip(dims=[1])
+        last_pos = flipped.argmax(dim=1)
+        col = attention_mask.shape[1] - last_pos - 1
+        row = torch.arange(hidden_state.shape[0], device=hidden_state.device)
+        return hidden_state[row, col]
+
     def encode(self, image, qwen_vl_model):
-        # This is a placeholder — the actual Qwen3-VL encoding depends on
-        # how the user loads the model. For now, use AnimaImageEmbLoader
-        # with pre-computed embeddings from stage6_emb.
-        raise NotImplementedError(
-            "Use AnimaImageEmbLoader with pre-computed .pt embeddings instead. "
-            "See stage6_emb/ for how to compute Qwen3-VL embeddings."
-        )
+        from PIL import Image as PILImage
+        from qwen_vl_utils import process_vision_info
+
+        model = qwen_vl_model["model"]
+        processor = qwen_vl_model["processor"]
+        device = model.device
+
+        # ComfyUI IMAGE: [B, H, W, 3] float [0,1] → PIL
+        if image.ndim == 4:
+            batch = image
+        else:
+            batch = image.unsqueeze(0)
+
+        embeddings = []
+        for i in range(batch.shape[0]):
+            img_np = (batch[i].cpu().numpy() * 255).clip(0, 255).astype("uint8")
+            pil_img = PILImage.fromarray(img_np)
+
+            messages = [
+                {"role": "system", "content": [{"type": "text", "text": "Represent the user's input."}]},
+                {"role": "user", "content": [
+                    {"type": "image", "image": pil_img, "min_pixels": 256 * 28 * 28, "max_pixels": 512 * 28 * 28},
+                    {"type": "text", "text": "Describe this image."},
+                ]},
+            ]
+
+            text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            images, _, _ = process_vision_info([messages], return_video_kwargs=True)
+            inputs = processor(text=[text], images=images, padding=True, return_tensors="pt").to(device)
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+
+            emb = self._pooling_last(outputs.last_hidden_state, inputs["attention_mask"])
+            emb = F.normalize(emb[:, :1024], p=2, dim=-1)  # Matryoshka truncation + L2 norm
+            embeddings.append(emb.squeeze(0).cpu())
+
+        result = torch.stack(embeddings) if len(embeddings) > 1 else embeddings[0]
+        return (result,)
 
 
 NODE_CLASS_MAPPINGS = {
     "AnimaIPAdapterLoader": AnimaIPAdapterLoader,
     "AnimaIPAdapterApply": AnimaIPAdapterApply,
     "AnimaImageEmbLoader": AnimaImageEmbLoader,
+    "AnimaQwenVLLoader": AnimaQwenVLLoader,
+    "AnimaQwenVLEncodeImage": AnimaQwenVLEncodeImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AnimaIPAdapterLoader": "Anima IP-Adapter Loader",
     "AnimaIPAdapterApply": "Anima IP-Adapter Apply",
     "AnimaImageEmbLoader": "Anima Image Embedding Loader",
+    "AnimaQwenVLLoader": "Anima Qwen3-VL Loader",
+    "AnimaQwenVLEncodeImage": "Anima Qwen3-VL Encode Image",
 }
