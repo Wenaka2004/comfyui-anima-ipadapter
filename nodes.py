@@ -241,7 +241,12 @@ class AnimaQwenVLLoader:
     CATEGORY = "anima_ipadapter"
 
     def load(self, model_path):
+        from pathlib import Path
         from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+        # Normalize path for Windows compatibility (backslash → forward slash)
+        if Path(model_path).exists():
+            model_path = str(Path(model_path).resolve())
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = Qwen3VLForConditionalGeneration.from_pretrained(
