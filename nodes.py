@@ -325,9 +325,10 @@ class AnimaQwenVLEncodeImage:
             inputs = processor(text=[text], images=images, padding=True, return_tensors="pt").to(device)
 
             with torch.no_grad():
-                outputs = model(**inputs)
+                outputs = model(**inputs, output_hidden_states=True)
 
-            emb = self._pooling_last(outputs.last_hidden_state, inputs["attention_mask"])
+            hidden_state = outputs.hidden_states[-1]
+            emb = self._pooling_last(hidden_state, inputs["attention_mask"])
             emb = F.normalize(emb[:, :1024], p=2, dim=-1)  # Matryoshka truncation + L2 norm
             embeddings.append(emb.squeeze(0).cpu())
 
