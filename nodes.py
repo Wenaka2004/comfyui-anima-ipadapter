@@ -11,6 +11,19 @@ from .ip_adapter_model import IPAdapter
 
 # ─── IP-Adapter Injection ────────────────────────────────────────────
 
+def _move_to_match(tensor_or_module, target_device, target_dtype):
+    """Move a tensor or nn.Module to target device/dtype if needed. Returns the moved object."""
+    if isinstance(tensor_or_module, torch.Tensor):
+        if tensor_or_module.device != target_device or tensor_or_module.dtype != target_dtype:
+            return tensor_or_module.to(device=target_device, dtype=target_dtype)
+    elif isinstance(tensor_or_module, nn.Module):
+        cur_dev = next(tensor_or_module.parameters()).device
+        cur_dt = next(tensor_or_module.parameters()).dtype
+        if cur_dev != target_device or cur_dt != target_dtype:
+            return tensor_or_module.to(device=target_device, dtype=target_dtype)
+    return tensor_or_module
+
+
 def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
                             weight, start_at, end_at, current_sigma,
                             x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
@@ -20,14 +33,6 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
         original:  x = gate * text_attn_out + residual
         with IPA:  x = gate * (text_attn_out + λ * ip_attn_out) + residual
     """
-    # Ensure ip_adapter and image_tokens are on the same device/dtype as the input
-    target_device = x_B_T_H_W_D.device
-    target_dtype = emb_B_T_D.dtype
-    if next(ip_adapter.parameters()).device != target_device or next(ip_adapter.parameters()).dtype != target_dtype:
-        ip_adapter = ip_adapter.to(device=target_device, dtype=target_dtype)
-    if image_tokens.device != target_device or image_tokens.dtype != target_dtype:
-        image_tokens = image_tokens.to(device=target_device, dtype=target_dtype)
-
     residual_dtype = x_B_T_H_W_D.dtype
     compute_dtype = emb_B_T_D.dtype
 
@@ -53,7 +58,7 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
 
     B, T, H, W, D = x_B_T_H_W_D.shape
 
-    # 1. Self-attention
+    # 1. Self-attention (identical to original)
     normed = _fn(x_B_T_H_W_D, block.layer_norm_self_attn, sc1, s1)
     result = rearrange(
         block.self_attn(
@@ -73,20 +78,24 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
         "b (t h w) d -> b t h w d", t=T, h=H, w=W,
     )
 
+    gate = rearrange(g2, "b t d -> b t 1 1 d")
+
     # Apply IP-Adapter only within [start_at, end_at] step range
-    ip_result = torch.zeros_like(text_result)
-    if start_at <= current_sigma <= end_at:
+    if start_at <= current_sigma <= end_at and weight > 0:
+        # Move ip_adapter and image_tokens to match input device/dtype at call time
+        ip_adapter = _move_to_match(ip_adapter, x_B_T_H_W_D.device, compute_dtype)
+        image_tokens = _move_to_match(image_tokens, x_B_T_H_W_D.device, compute_dtype)
         # Expand image_tokens to match batch size (CFG uses B=2)
         if image_tokens.shape[0] < B:
             image_tokens = image_tokens.expand(B, -1, -1)
         ip_out = ip_adapter.forward_block(block_idx, normed_flat, image_tokens)
         ip_out = rearrange(ip_out, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
-        ip_result = weight * ip_out
+        x_B_T_H_W_D = gate.to(residual_dtype) * (text_result.to(residual_dtype) + weight * ip_out.to(residual_dtype)) + x_B_T_H_W_D
+    else:
+        # Identical to original Block.forward
+        x_B_T_H_W_D = gate.to(residual_dtype) * text_result.to(residual_dtype) + x_B_T_H_W_D
 
-    gate = rearrange(g2, "b t d -> b t 1 1 d")
-    x_B_T_H_W_D = gate.to(residual_dtype) * (text_result.to(residual_dtype) + ip_result.to(residual_dtype)) + x_B_T_H_W_D
-
-    # 3. MLP
+    # 3. MLP (identical to original)
     normed = _fn(x_B_T_H_W_D, block.layer_norm_mlp, sc3, s3)
     result = block.mlp(normed.to(compute_dtype))
     x_B_T_H_W_D = x_B_T_H_W_D + rearrange(g3, "b t d -> b t 1 1 d").to(residual_dtype) * result.to(residual_dtype)
@@ -113,12 +122,9 @@ class IPAdapterHook:
 
             def make_forward(of, idx):
                 def new_forward(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
-                    # Derive current progress from timestep embedding
-                    # emb_B_T_D contains the pooled timestep signal; extract sigma
                     transformer_options = kwargs.get("transformer_options", {})
                     current_sigma = transformer_options.get("sigmas", None)
                     if current_sigma is not None:
-                        # sigma is per-batch, take first element as proxy
                         if hasattr(current_sigma, 'item'):
                             current_sigma = current_sigma.item()
                         elif hasattr(current_sigma, '__len__'):
@@ -186,7 +192,6 @@ class AnimaIPAdapterLoader:
         ip_adapter.eval()
         for p in ip_adapter.parameters():
             p.requires_grad_(False)
-        ip_adapter = ip_adapter.cuda()
 
         return (ip_adapter,)
 
@@ -216,9 +221,6 @@ class AnimaIPAdapterApply:
         dtype = dit.dtype
         device = next(dit.parameters()).device
 
-        # Ensure ipadapter is on the same device and dtype as DiT
-        ipadapter = ipadapter.to(dtype=dtype, device=device)
-
         # Resample embedding → image tokens
         with torch.no_grad():
             if image_emb.ndim == 1:
@@ -227,13 +229,7 @@ class AnimaIPAdapterApply:
                 image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
             image_tokens = ipadapter.resample(image_emb.to(dtype=dtype, device=device))  # [1, 16, 1024]
 
-        # Verify ipadapter is actually on GPU (safety check)
-        first_param_device = next(ipadapter.parameters()).device
-        if first_param_device != device:
-            ipadapter = ipadapter.to(device=device)
-            image_tokens = image_tokens.to(device=device)
-
-        # Hook into model — weight/start_at/end_at passed to hook, NOT modifying ip_scales
+        # Hook into model — weight/start_at/end_at passed to hook
         hook = IPAdapterHook(ipadapter, image_tokens, weight, start_at, end_at)
         hook.attach(model)
 
