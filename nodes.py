@@ -221,6 +221,9 @@ class AnimaIPAdapterApply:
         dtype = dit.dtype
         device = next(dit.parameters()).device
 
+        # Move ipadapter to model's dtype and device before resample
+        ipadapter = ipadapter.to(dtype=dtype, device=device)
+
         # Resample embedding → image tokens
         with torch.no_grad():
             if image_emb.ndim == 1:
@@ -229,7 +232,7 @@ class AnimaIPAdapterApply:
                 image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
             image_tokens = ipadapter.resample(image_emb.to(dtype=dtype, device=device))  # [1, 16, 1024]
 
-        # Hook into model — weight/start_at/end_at passed to hook
+        # Hook into model — pass the moved ipadapter to hook
         hook = IPAdapterHook(ipadapter, image_tokens, weight, start_at, end_at)
         hook.attach(model)
 
