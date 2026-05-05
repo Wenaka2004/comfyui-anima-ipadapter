@@ -90,6 +90,12 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
             image_tokens = image_tokens.expand(B, -1, -1)
         ip_out = ip_adapter.forward_block(block_idx, normed_flat, image_tokens)
         ip_out = rearrange(ip_out, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
+        # Adaptive normalization: scale ip_out to match text_result magnitude
+        # so weight=1.0 means ip contributes equally to text, weight=0.5 means half
+        text_norm = text_result.to(residual_dtype).norm()
+        ip_norm = ip_out.to(residual_dtype).norm()
+        if ip_norm > 0:
+            ip_out = ip_out * (text_norm / ip_norm)
         x_B_T_H_W_D = gate.to(residual_dtype) * (text_result.to(residual_dtype) + weight * ip_out.to(residual_dtype)) + x_B_T_H_W_D
     else:
         # Identical to original Block.forward
