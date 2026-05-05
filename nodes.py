@@ -186,7 +186,7 @@ class AnimaIPAdapterApply:
                 image_emb = image_emb.unsqueeze(0)  # [1, 1024]
             if image_emb.ndim == 2:
                 image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
-            ipadapter = ipadapter.to(dtype)
+            ipadapter = ipadapter.to(dtype=dtype, device=model.model.diffusion_model.device)
             image_tokens = ipadapter.resample(image_emb.to(dtype))  # [1, 16, 1024]
 
         # Scale ip_scales by weight
