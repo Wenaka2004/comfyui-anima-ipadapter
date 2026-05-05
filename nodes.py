@@ -233,6 +233,7 @@ class AnimaQwenVLLoader:
         return {
             "required": {
                 "model_path": ("STRING", {"default": "Qwen/Qwen3-VL-Embedding-2B", "tooltip": "HuggingFace model ID or local path to Qwen3-VL-Embedding-2B"}),
+                "dtype": (["bf16", "fp8", "int8"], {"default": "bf16", "tooltip": "Model precision"}),
             }
         }
 
@@ -240,18 +241,29 @@ class AnimaQwenVLLoader:
     FUNCTION = "load"
     CATEGORY = "anima_ipadapter"
 
-    def load(self, model_path):
+    def load(self, model_path, dtype):
         from pathlib import Path
-        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 
-        # Normalize path for Windows compatibility (backslash → forward slash)
         if Path(model_path).exists():
             model_path = str(Path(model_path).resolve())
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
-        ).to(device).eval()
+
+        if dtype == "bf16":
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+            ).to(device).eval()
+        elif dtype == "fp8":
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_path, torch_dtype=torch.float8_e4m3fn, trust_remote_code=True,
+            ).to(device).eval()
+        elif dtype == "int8":
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+            model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_path, quantization_config=quant_config, trust_remote_code=True,
+            ).eval()
+
         processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
         return ({"model": model, "processor": processor},)
 
