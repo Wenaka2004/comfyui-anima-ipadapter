@@ -178,13 +178,16 @@ class AnimaIPAdapterApply:
     CATEGORY = "anima_ipadapter"
 
     def apply(self, model, ipadapter, image_emb, start_at, end_at, weight):
+        dtype = model.model.diffusion_model.dtype
+
         # Resample embedding → image tokens
         with torch.no_grad():
             if image_emb.ndim == 1:
                 image_emb = image_emb.unsqueeze(0)  # [1, 1024]
             if image_emb.ndim == 2:
                 image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
-            image_tokens = ipadapter.resample(image_emb.to(model.model.diffusion_model.dtype))  # [1, 16, 1024]
+            ipadapter = ipadapter.to(dtype)
+            image_tokens = ipadapter.resample(image_emb.to(dtype))  # [1, 16, 1024]
 
         # Scale ip_scales by weight
         if weight != 1.0:
@@ -322,7 +325,8 @@ class AnimaQwenVLEncodeImage:
 
             text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             images, _, _ = process_vision_info([messages], return_video_kwargs=True)
-            inputs = processor(text=[text], images=images, padding=True, return_tensors="pt").to(device)
+            inputs = processor(text=[text], images=images, padding=True, return_tensors="pt")
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
             with torch.no_grad():
                 outputs = model(**inputs, output_hidden_states=True)
