@@ -120,7 +120,7 @@ class IPAdapterHook:
         for block_idx, block in enumerate(dit.blocks):
             orig_forward = block.forward
 
-            def make_forward(of, idx):
+            def make_forward(of, idx, blk):
                 def new_forward(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
                     transformer_options = kwargs.get("transformer_options", {})
                     current_sigma = transformer_options.get("sigmas", None)
@@ -133,13 +133,13 @@ class IPAdapterHook:
                         current_sigma = 1.0  # fallback: always apply
 
                     return _block_forward_with_ip(
-                        block, idx, self.ip_adapter, self.image_tokens,
+                        blk, idx, self.ip_adapter, self.image_tokens,
                         self.weight, self.start_at, self.end_at, current_sigma,
                         x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs,
                     )
                 return new_forward
 
-            block.forward = make_forward(orig_forward, block_idx)
+            block.forward = make_forward(orig_forward, block_idx, block)
             self._patches.append((block, orig_forward))
 
     def detach(self):
