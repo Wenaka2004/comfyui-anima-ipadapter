@@ -1,0 +1,264 @@
+"""ComfyUI custom nodes for Anima IP-Adapter."""
+
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+from .ip_adapter_model import IPAdapter
+
+
+# ─── IP-Adapter Injection ────────────────────────────────────────────
+
+def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
+                            x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
+    """Block.forward with IP-Adapter cross-attention injection.
+
+    Identical to Block.forward but adds ip_cross_attn after text cross_attn:
+        original:  x = gate * text_attn_out + residual
+        with IPA:  x = gate * (text_attn_out + λ * ip_attn_out) + residual
+    """
+    residual_dtype = x_B_T_H_W_D.dtype
+    compute_dtype = emb_B_T_D.dtype
+
+    rope_emb = kwargs.get("rope_emb_L_1_1_D", None)
+    adaln_lora = kwargs.get("adaln_lora_B_T_3D", None)
+    extra_pos_emb = kwargs.get("extra_per_block_pos_emb", None)
+    transformer_options = kwargs.get("transformer_options", {})
+
+    if extra_pos_emb is not None:
+        x_B_T_H_W_D = x_B_T_H_W_D + extra_pos_emb
+
+    if block.use_adaln_lora:
+        s1, sc1, g1 = (block.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora).chunk(3, dim=-1)
+        s2, sc2, g2 = (block.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora).chunk(3, dim=-1)
+        s3, sc3, g3 = (block.adaln_modulation_mlp(emb_B_T_D) + adaln_lora).chunk(3, dim=-1)
+    else:
+        s1, sc1, g1 = block.adaln_modulation_self_attn(emb_B_T_D).chunk(3, dim=-1)
+        s2, sc2, g2 = block.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
+        s3, sc3, g3 = block.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+
+    def _fn(_x, _norm, _scale, _shift):
+        return _norm(_x) * (1 + rearrange(_scale, "b t d -> b t 1 1 d")) + rearrange(_shift, "b t d -> b t 1 1 d")
+
+    B, T, H, W, D = x_B_T_H_W_D.shape
+
+    # 1. Self-attention
+    normed = _fn(x_B_T_H_W_D, block.layer_norm_self_attn, sc1, s1)
+    result = rearrange(
+        block.self_attn(
+            rearrange(normed.to(compute_dtype), "b t h w d -> b (t h w) d"),
+            None, rope_emb=rope_emb, transformer_options=transformer_options,
+        ),
+        "b (t h w) d -> b t h w d", t=T, h=H, w=W,
+    )
+    x_B_T_H_W_D = x_B_T_H_W_D + rearrange(g1, "b t d -> b t 1 1 d").to(residual_dtype) * result.to(residual_dtype)
+
+    # 2. Cross-attention (text) + IP-Adapter injection
+    normed = _fn(x_B_T_H_W_D, block.layer_norm_cross_attn, sc2, s2)
+    normed_flat = rearrange(normed.to(compute_dtype), "b t h w d -> b (t h w) d")
+
+    text_result = rearrange(
+        block.cross_attn(normed_flat, crossattn_emb, rope_emb=rope_emb, transformer_options=transformer_options),
+        "b (t h w) d -> b t h w d", t=T, h=H, w=W,
+    )
+
+    ip_result = ip_adapter.forward_block(block_idx, normed_flat, image_tokens)
+    ip_result = rearrange(ip_result, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
+
+    gate = rearrange(g2, "b t d -> b t 1 1 d")
+    x_B_T_H_W_D = gate.to(residual_dtype) * (text_result.to(residual_dtype) + ip_result.to(residual_dtype)) + x_B_T_H_W_D
+
+    # 3. MLP
+    normed = _fn(x_B_T_H_W_D, block.layer_norm_mlp, sc3, s3)
+    result = block.mlp(normed.to(compute_dtype))
+    x_B_T_H_W_D = x_B_T_H_W_D + rearrange(g3, "b t d -> b t 1 1 d").to(residual_dtype) * result.to(residual_dtype)
+
+    return x_B_T_H_W_D
+
+
+class IPAdapterHook:
+    """Hooks into Anima's DiT to inject IP-Adapter during sampling."""
+
+    def __init__(self, ip_adapter, image_tokens):
+        self.ip_adapter = ip_adapter
+        self.image_tokens = image_tokens
+        self._patches = []
+
+    def attach(self, model_patcher):
+        """Monkey-patch each DiT block's forward method."""
+        dit = model_patcher.model.diffusion_model
+        for block_idx, block in enumerate(dit.blocks):
+            orig_forward = block.forward
+
+            def make_forward(of, idx):
+                def new_forward(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
+                    return _block_forward_with_ip(
+                        block, idx, self.ip_adapter, self.image_tokens,
+                        x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs,
+                    )
+                return new_forward
+
+            block.forward = make_forward(orig_forward, block_idx)
+            self._patches.append((block, orig_forward))
+
+    def detach(self):
+        """Restore original forward methods."""
+        for block, orig_forward in self._patches:
+            block.forward = orig_forward
+        self._patches.clear()
+
+
+# ─── ComfyUI Nodes ────────────────────────────────────────────────────
+
+class AnimaIPAdapterLoader:
+    """Load Anima IP-Adapter from safetensors checkpoint."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ipadapter_path": ("STRING", {"default": "", "tooltip": "Path to IP-Adapter safetensors file"}),
+            }
+        }
+
+    RETURN_TYPES = ("ANIMA_IPADAPTER",)
+    FUNCTION = "load"
+    CATEGORY = "anima_ipadapter"
+
+    def load(self, ipadapter_path):
+        from safetensors.torch import load_file
+        state = load_file(ipadapter_path)
+
+        # Auto-detect architecture from state dict
+        num_blocks = max(int(k.split(".")[1]) for k in state if k.startswith("ip_cross_attns.")) + 1
+        ip_dim = state["ip_cross_attns.0.q_proj.weight"].shape[0]
+        num_ip_heads = ip_dim // 64  # head_dim=64
+        num_tokens = state["resampler.latents"].shape[0]
+        emb_dim = state["resampler.latents"].shape[1]
+
+        ip_adapter = IPAdapter(
+            emb_dim=emb_dim,
+            x_dim=2048,
+            num_blocks=num_blocks,
+            ip_dim=ip_dim,
+            num_ip_heads=num_ip_heads,
+            ip_head_dim=64,
+            num_tokens=num_tokens,
+            num_perceiver_layers=2,
+            num_perceiver_heads=4,
+        )
+        ip_adapter.load_state_dict(state)
+        ip_adapter.eval()
+        for p in ip_adapter.parameters():
+            p.requires_grad_(False)
+
+        return (ip_adapter,)
+
+
+class AnimaIPAdapterApply:
+    """Apply IP-Adapter to an Anima model with a reference image embedding."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "ipadapter": ("ANIMA_IPADAPTER",),
+                "image_emb": ("ANIMA_IMAGE_EMB", {"tooltip": "Qwen3-VL embedding of reference image [1, 1024]"}),
+                "start_at": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percentage of sampling steps to apply IP-Adapter"}),
+                "end_at": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percentage of sampling steps to apply IP-Adapter"}),
+                "weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05, "tooltip": "Global scale for IP-Adapter influence"}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "anima_ipadapter"
+
+    def apply(self, model, ipadapter, image_emb, start_at, end_at, weight):
+        # Resample embedding → image tokens
+        with torch.no_grad():
+            if image_emb.ndim == 1:
+                image_emb = image_emb.unsqueeze(0)  # [1, 1024]
+            if image_emb.ndim == 2:
+                image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
+            image_tokens = ipadapter.resample(image_emb.to(model.model.diffusion_model.dtype))  # [1, 16, 1024]
+
+        # Scale ip_scales by weight
+        if weight != 1.0:
+            for s in ipadapter.ip_scales:
+                s.data.mul_(weight)
+
+        # Hook into model
+        hook = IPAdapterHook(ipadapter, image_tokens)
+        hook.attach(model)
+
+        # Store hook for cleanup
+        if not hasattr(model, "_ip_adapter_hooks"):
+            model._ip_adapter_hooks = []
+        model._ip_adapter_hooks.append(hook)
+
+        return (model,)
+
+
+class AnimaImageEmbLoader:
+    """Load a pre-computed Qwen3-VL image embedding from a .pt file."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "emb_path": ("STRING", {"default": "", "tooltip": "Path to .pt file containing image embedding"}),
+            }
+        }
+
+    RETURN_TYPES = ("ANIMA_IMAGE_EMB",)
+    FUNCTION = "load"
+    CATEGORY = "anima_ipadapter"
+
+    def load(self, emb_path):
+        emb = torch.load(emb_path, map_location="cpu", weights_only=True)
+        if emb.ndim > 2:
+            emb = emb.squeeze()
+        return (emb,)
+
+
+class AnimaIPAdapterEncodeImage:
+    """Compute Qwen3-VL embedding from a reference image (requires Qwen3-VL model)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "qwen_vl_model": ("QWEN_VL_MODEL",),
+            }
+        }
+
+    RETURN_TYPES = ("ANIMA_IMAGE_EMB",)
+    FUNCTION = "encode"
+    CATEGORY = "anima_ipadapter"
+
+    def encode(self, image, qwen_vl_model):
+        # This is a placeholder — the actual Qwen3-VL encoding depends on
+        # how the user loads the model. For now, use AnimaImageEmbLoader
+        # with pre-computed embeddings from stage6_emb.
+        raise NotImplementedError(
+            "Use AnimaImageEmbLoader with pre-computed .pt embeddings instead. "
+            "See stage6_emb/ for how to compute Qwen3-VL embeddings."
+        )
+
+
+NODE_CLASS_MAPPINGS = {
+    "AnimaIPAdapterLoader": AnimaIPAdapterLoader,
+    "AnimaIPAdapterApply": AnimaIPAdapterApply,
+    "AnimaImageEmbLoader": AnimaImageEmbLoader,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "AnimaIPAdapterLoader": "Anima IP-Adapter Loader",
+    "AnimaIPAdapterApply": "Anima IP-Adapter Apply",
+    "AnimaImageEmbLoader": "Anima Image Embedding Loader",
+}
