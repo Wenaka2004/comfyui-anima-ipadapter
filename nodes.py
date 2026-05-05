@@ -175,6 +175,7 @@ class AnimaIPAdapterLoader:
         ip_adapter.eval()
         for p in ip_adapter.parameters():
             p.requires_grad_(False)
+        ip_adapter = ip_adapter.cuda()
 
         return (ip_adapter,)
 
@@ -204,14 +205,22 @@ class AnimaIPAdapterApply:
         dtype = dit.dtype
         device = next(dit.parameters()).device
 
+        # Ensure ipadapter is on the same device and dtype as DiT
+        ipadapter = ipadapter.to(dtype=dtype, device=device)
+
         # Resample embedding → image tokens
         with torch.no_grad():
             if image_emb.ndim == 1:
                 image_emb = image_emb.unsqueeze(0)  # [1, 1024]
             if image_emb.ndim == 2:
                 image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
-            ipadapter = ipadapter.to(dtype=dtype, device=device)
             image_tokens = ipadapter.resample(image_emb.to(dtype=dtype, device=device))  # [1, 16, 1024]
+
+        # Verify ipadapter is actually on GPU (safety check)
+        first_param_device = next(ipadapter.parameters()).device
+        if first_param_device != device:
+            ipadapter = ipadapter.to(device=device)
+            image_tokens = image_tokens.to(device=device)
 
         # Hook into model — weight/start_at/end_at passed to hook, NOT modifying ip_scales
         hook = IPAdapterHook(ipadapter, image_tokens, weight, start_at, end_at)
