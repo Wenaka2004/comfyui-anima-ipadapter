@@ -183,6 +183,20 @@ class AnimaIPAdapterLoader:
         num_tokens = state["resampler.latents"].shape[0]
         emb_dim = state["resampler.latents"].shape[1]
 
+        # Detect v2 (has input_proj) vs v1
+        num_input_tokens = 8  # default v2
+        if "resampler.input_proj.proj.weight" in state:
+            num_input_tokens = state["resampler.input_proj.proj.weight"].shape[0] // emb_dim
+
+        # Detect perceiver layers count
+        num_perceiver_layers = sum(1 for k in state if k.startswith("resampler.layers.") and k.endswith(".self_attn_norm.weight"))
+        num_perceiver_heads = 4
+        if num_perceiver_layers > 0:
+            # Detect heads from MHA in_proj
+            in_proj_key = "resampler.layers.0.self_attn.in_proj_weight"
+            if in_proj_key in state:
+                num_perceiver_heads = state[in_proj_key].shape[0] // (3 * emb_dim)
+
         ip_adapter = IPAdapter(
             emb_dim=emb_dim,
             x_dim=2048,
@@ -191,8 +205,9 @@ class AnimaIPAdapterLoader:
             num_ip_heads=num_ip_heads,
             ip_head_dim=64,
             num_tokens=num_tokens,
-            num_perceiver_layers=2,
-            num_perceiver_heads=4,
+            num_perceiver_layers=num_perceiver_layers,
+            num_perceiver_heads=num_perceiver_heads,
+            num_input_tokens=num_input_tokens,
         )
         ip_adapter.load_state_dict(state)
         ip_adapter.eval()
