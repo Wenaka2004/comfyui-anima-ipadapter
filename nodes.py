@@ -20,6 +20,14 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
         original:  x = gate * text_attn_out + residual
         with IPA:  x = gate * (text_attn_out + λ * ip_attn_out) + residual
     """
+    # Ensure ip_adapter and image_tokens are on the same device/dtype as the input
+    target_device = x_B_T_H_W_D.device
+    target_dtype = emb_B_T_D.dtype
+    if next(ip_adapter.parameters()).device != target_device or next(ip_adapter.parameters()).dtype != target_dtype:
+        ip_adapter = ip_adapter.to(device=target_device, dtype=target_dtype)
+    if image_tokens.device != target_device or image_tokens.dtype != target_dtype:
+        image_tokens = image_tokens.to(device=target_device, dtype=target_dtype)
+
     residual_dtype = x_B_T_H_W_D.dtype
     compute_dtype = emb_B_T_D.dtype
 
