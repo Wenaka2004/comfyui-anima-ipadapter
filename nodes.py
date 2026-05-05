@@ -178,7 +178,9 @@ class AnimaIPAdapterApply:
     CATEGORY = "anima_ipadapter"
 
     def apply(self, model, ipadapter, image_emb, start_at, end_at, weight):
-        dtype = model.model.diffusion_model.dtype
+        dit = model.model.diffusion_model
+        dtype = dit.dtype
+        device = next(dit.parameters()).device
 
         # Resample embedding → image tokens
         with torch.no_grad():
@@ -186,7 +188,7 @@ class AnimaIPAdapterApply:
                 image_emb = image_emb.unsqueeze(0)  # [1, 1024]
             if image_emb.ndim == 2:
                 image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
-            ipadapter = ipadapter.to(dtype=dtype, device=model.model.diffusion_model.device)
+            ipadapter = ipadapter.to(dtype=dtype, device=device)
             image_tokens = ipadapter.resample(image_emb.to(dtype))  # [1, 16, 1024]
 
         # Scale ip_scales by weight
