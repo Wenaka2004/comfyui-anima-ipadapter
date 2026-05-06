@@ -90,7 +90,8 @@ class IPAdapterCrossAttention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
         self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
         self.output_proj = nn.Linear(inner_dim, x_dim, bias=False)
-        nn.init.zeros_(self.output_proj.weight)
+        # Small random init (NOT zero-init) so gradients flow from step 0
+        nn.init.normal_(self.output_proj.weight, std=0.01)
 
     def forward(self, x, context):
         B, S, _ = x.shape
