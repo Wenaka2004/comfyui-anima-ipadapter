@@ -1,9 +1,6 @@
-"""IP-Adapter model for Anima — v2 with improved resampler.
+"""IP-Adapter model for Anima — v3 with MLP Token Projector.
 
-v2 fixes:
-1. Input projection: 1x1024 token → 8x1024 tokens before perceiver
-2. Cross-attn gate in PerceiverLayer (learnable scalar, init=2.0)
-3. Fewer latents: 8 instead of 16
+v3: Replaces Perceiver Resampler with pure feedforward MLP projector.
 """
 
 import torch
@@ -12,70 +9,34 @@ import torch.nn.functional as F
 from einops import rearrange
 
 
-class InputProjection(nn.Module):
-    """Project single 1024-dim token into multiple tokens for perceiver."""
+class MLPTokenProjector(nn.Module):
+    """Pure feedforward: 1024 → hidden → num_tokens * 1024. No collapse risk."""
 
-    def __init__(self, emb_dim=1024, num_input_tokens=8):
-        super().__init__()
-        self.num_input_tokens = num_input_tokens
-        self.proj = nn.Linear(emb_dim, emb_dim * num_input_tokens, bias=False)
-
-    def forward(self, x):
-        B = x.shape[0]
-        out = self.proj(x)
-        out = out.reshape(B, self.num_input_tokens, -1)
-        return out
-
-
-class PerceiverLayer(nn.Module):
-    def __init__(self, emb_dim, num_heads, ff_mult):
-        super().__init__()
-        self.self_attn_norm = nn.LayerNorm(emb_dim)
-        self.self_attn = nn.MultiheadAttention(emb_dim, num_heads, batch_first=True)
-        self.cross_attn_norm = nn.LayerNorm(emb_dim)
-        self.cross_attn_norm_kv = nn.LayerNorm(emb_dim)
-        self.cross_attn = nn.MultiheadAttention(emb_dim, num_heads, batch_first=True)
-        self.cross_attn_gate = nn.Parameter(torch.tensor(2.0))
-        self.ff_norm = nn.LayerNorm(emb_dim)
-        self.ff = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim * ff_mult),
-            nn.GELU(),
-            nn.Linear(emb_dim * ff_mult, emb_dim),
-        )
-
-    def forward(self, x, context):
-        residual = x
-        x_norm = self.self_attn_norm(x)
-        x_attn, _ = self.self_attn(x_norm, x_norm, x_norm)
-        x = residual + x_attn
-        residual = x
-        x_norm = self.cross_attn_norm(x)
-        ctx_norm = self.cross_attn_norm_kv(context)
-        x_attn, _ = self.cross_attn(x_norm, ctx_norm, ctx_norm)
-        x = residual + self.cross_attn_gate * x_attn
-        residual = x
-        x = residual + self.ff(self.ff_norm(x))
-        return x
-
-
-class PerceiverResampler(nn.Module):
-    def __init__(self, emb_dim=1024, num_tokens=8, num_input_tokens=8, num_layers=2, num_heads=4, ff_mult=4):
+    def __init__(self, input_dim=1024, output_dim=1024, num_tokens=8, hidden_mult=4):
         super().__init__()
         self.num_tokens = num_tokens
-        self.input_proj = InputProjection(emb_dim, num_input_tokens)
-        self.latents = nn.Parameter(torch.randn(num_tokens, emb_dim) * 0.02)
-        self.layers = nn.ModuleList([
-            PerceiverLayer(emb_dim, num_heads, ff_mult) for _ in range(num_layers)
-        ])
-        self.norm = nn.LayerNorm(emb_dim)
+        self.output_dim = output_dim
+        hidden_dim = num_tokens * output_dim * hidden_mult
+        self.hidden_per_token = hidden_dim // num_tokens
 
-    def forward(self, image_emb):
-        B = image_emb.shape[0]
-        context = self.input_proj(image_emb)
-        x = self.latents.unsqueeze(0).expand(B, -1, -1)
-        for layer in self.layers:
-            x = layer(x, context)
-        return self.norm(x)
+        self.proj_up = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.norm = nn.LayerNorm(self.hidden_per_token)
+        self.proj_down = nn.Linear(self.hidden_per_token, output_dim, bias=False)
+        self.norm_out = nn.LayerNorm(output_dim)
+
+        nn.init.normal_(self.proj_up.weight, std=0.02)
+        nn.init.normal_(self.proj_down.weight, std=0.02)
+
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x.squeeze(1)
+        h = self.proj_up(x)
+        h = h.view(x.shape[0], self.num_tokens, self.hidden_per_token)
+        h = self.norm(h)
+        h = F.gelu(h)
+        tokens = self.proj_down(h)
+        tokens = self.norm_out(tokens)
+        return tokens
 
 
 class IPAdapterCrossAttention(nn.Module):
@@ -90,8 +51,10 @@ class IPAdapterCrossAttention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
         self.v_proj = nn.Linear(context_dim, inner_dim, bias=False)
         self.output_proj = nn.Linear(inner_dim, x_dim, bias=False)
-        # Small random init (NOT zero-init) so gradients flow from step 0
         nn.init.normal_(self.output_proj.weight, std=0.01)
+        nn.init.normal_(self.q_proj.weight, std=0.01)
+        nn.init.normal_(self.k_proj.weight, std=0.01)
+        nn.init.normal_(self.v_proj.weight, std=0.01)
 
     def forward(self, x, context):
         B, S, _ = x.shape
@@ -117,18 +80,15 @@ class IPAdapter(nn.Module):
         num_ip_heads=8,
         ip_head_dim=64,
         num_tokens=8,
-        num_perceiver_layers=2,
-        num_perceiver_heads=4,
-        num_input_tokens=8,
+        mlp_hidden_mult=4,
     ):
         super().__init__()
         self.num_blocks = num_blocks
-        self.resampler = PerceiverResampler(
-            emb_dim=emb_dim,
+        self.token_projector = MLPTokenProjector(
+            input_dim=emb_dim,
+            output_dim=emb_dim,
             num_tokens=num_tokens,
-            num_input_tokens=num_input_tokens,
-            num_layers=num_perceiver_layers,
-            num_heads=num_perceiver_heads,
+            hidden_mult=mlp_hidden_mult,
         )
         self.ip_cross_attns = nn.ModuleList([
             IPAdapterCrossAttention(
@@ -141,12 +101,12 @@ class IPAdapter(nn.Module):
             for _ in range(num_blocks)
         ])
         self.ip_scales = nn.ParameterList([
-            nn.Parameter(torch.ones(1))
+            nn.Parameter(torch.full((1,), 0.01))
             for _ in range(num_blocks)
         ])
 
     def resample(self, image_emb):
-        return self.resampler(image_emb)
+        return self.token_projector(image_emb)
 
     def forward_block(self, block_idx, normalized_x, image_tokens):
         ip_out = self.ip_cross_attns[block_idx](normalized_x, image_tokens)

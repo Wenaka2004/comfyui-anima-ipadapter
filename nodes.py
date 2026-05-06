@@ -180,35 +180,31 @@ class AnimaIPAdapterLoader:
         num_blocks = max(int(k.split(".")[1]) for k in state if k.startswith("ip_cross_attns.")) + 1
         ip_dim = state["ip_cross_attns.0.q_proj.weight"].shape[0]
         num_ip_heads = ip_dim // 64  # head_dim=64
-        num_tokens = state["resampler.latents"].shape[0]
-        emb_dim = state["resampler.latents"].shape[1]
 
-        # Detect v2 (has input_proj) vs v1
-        num_input_tokens = 8  # default v2
-        if "resampler.input_proj.proj.weight" in state:
-            num_input_tokens = state["resampler.input_proj.proj.weight"].shape[0] // emb_dim
-
-        # Detect perceiver layers count
-        num_perceiver_layers = sum(1 for k in state if k.startswith("resampler.layers.") and k.endswith(".self_attn_norm.weight"))
-        num_perceiver_heads = 4
-        if num_perceiver_layers > 0:
-            # Detect heads from MHA in_proj
-            in_proj_key = "resampler.layers.0.self_attn.in_proj_weight"
-            if in_proj_key in state:
-                num_perceiver_heads = state[in_proj_key].shape[0] // (3 * emb_dim)
-
-        ip_adapter = IPAdapter(
-            emb_dim=emb_dim,
-            x_dim=2048,
-            num_blocks=num_blocks,
-            ip_dim=ip_dim,
-            num_ip_heads=num_ip_heads,
-            ip_head_dim=64,
-            num_tokens=num_tokens,
-            num_perceiver_layers=num_perceiver_layers,
-            num_perceiver_heads=num_perceiver_heads,
-            num_input_tokens=num_input_tokens,
-        )
+        # Detect v3 (MLP projector) vs v1/v2 (Perceiver)
+        if "token_projector.proj_up.weight" in state:
+            # v3: MLP Token Projector
+            num_tokens = state["token_projector.proj_down.weight"].shape[0]
+            emb_dim = state["token_projector.proj_down.weight"].shape[1]
+            proj_up_shape = state["token_projector.proj_up.weight"].shape
+            hidden_dim = proj_up_shape[0]
+            mlp_hidden_mult = hidden_dim // (num_tokens * emb_dim)
+            ip_adapter = IPAdapter(
+                emb_dim=emb_dim, x_dim=2048, num_blocks=num_blocks,
+                ip_dim=ip_dim, num_ip_heads=num_ip_heads, ip_head_dim=64,
+                num_tokens=num_tokens, mlp_hidden_mult=mlp_hidden_mult,
+            )
+        elif "resampler.latents" in state:
+            # v1/v2: Perceiver Resampler
+            num_tokens = state["resampler.latents"].shape[0]
+            emb_dim = state["resampler.latents"].shape[1]
+            ip_adapter = IPAdapter(
+                emb_dim=emb_dim, x_dim=2048, num_blocks=num_blocks,
+                ip_dim=ip_dim, num_ip_heads=num_ip_heads, ip_head_dim=64,
+                num_tokens=num_tokens, mlp_hidden_mult=4,
+            )
+        else:
+            raise KeyError("Unknown checkpoint format — neither token_projector nor resampler.latents found")
         ip_adapter.load_state_dict(state)
         ip_adapter.eval()
         for p in ip_adapter.parameters():
