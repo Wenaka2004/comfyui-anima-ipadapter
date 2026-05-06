@@ -24,14 +24,13 @@ def _move_to_match(tensor_or_module, target_device, target_dtype):
     return tensor_or_module
 
 
-def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
+def _block_forward_with_ip(block, block_idx, ip_adapter, vl_emb,
                             weight, start_at, end_at, current_sigma,
                             x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
-    """Block.forward with IP-Adapter cross-attention injection.
+    """Block.forward with IP AdaLN modulation after MLP.
 
-    Identical to Block.forward but adds ip_cross_attn after text cross_attn:
-        original:  x = gate * text_attn_out + residual
-        with IPA:  x = gate * (text_attn_out + λ * ip_attn_out) + residual
+    Identical to original Block.forward, with IP modulation added after MLP:
+        x = x * (1 + weight * scale) + weight * shift
     """
     residual_dtype = x_B_T_H_W_D.dtype
     compute_dtype = emb_B_T_D.dtype
@@ -58,7 +57,7 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
 
     B, T, H, W, D = x_B_T_H_W_D.shape
 
-    # 1. Self-attention (identical to original)
+    # 1. Self-attention
     normed = _fn(x_B_T_H_W_D, block.layer_norm_self_attn, sc1, s1)
     result = rearrange(
         block.self_attn(
@@ -69,52 +68,42 @@ def _block_forward_with_ip(block, block_idx, ip_adapter, image_tokens,
     )
     x_B_T_H_W_D = x_B_T_H_W_D + rearrange(g1, "b t d -> b t 1 1 d").to(residual_dtype) * result.to(residual_dtype)
 
-    # 2. Cross-attention (text) + IP-Adapter injection
+    # 2. Cross-attention (text)
     normed = _fn(x_B_T_H_W_D, block.layer_norm_cross_attn, sc2, s2)
     normed_flat = rearrange(normed.to(compute_dtype), "b t h w d -> b (t h w) d")
-
     text_result = rearrange(
         block.cross_attn(normed_flat, crossattn_emb, rope_emb=rope_emb, transformer_options=transformer_options),
         "b (t h w) d -> b t h w d", t=T, h=H, w=W,
     )
-
     gate = rearrange(g2, "b t d -> b t 1 1 d")
+    x_B_T_H_W_D = gate.to(residual_dtype) * text_result.to(residual_dtype) + x_B_T_H_W_D
 
-    # Apply IP-Adapter only within [start_at, end_at] step range
-    if start_at <= current_sigma <= end_at and weight > 0:
-        # Move ip_adapter and image_tokens to match input device/dtype at call time
-        ip_adapter = _move_to_match(ip_adapter, x_B_T_H_W_D.device, compute_dtype)
-        image_tokens = _move_to_match(image_tokens, x_B_T_H_W_D.device, compute_dtype)
-        # Expand image_tokens to match batch size (CFG uses B=2)
-        if image_tokens.shape[0] < B:
-            image_tokens = image_tokens.expand(B, -1, -1)
-        ip_out = ip_adapter.forward_block(block_idx, normed_flat, image_tokens)
-        ip_out = rearrange(ip_out, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
-        # Adaptive normalization: scale ip_out to match text_result magnitude
-        # so weight=1.0 means ip contributes equally to text, weight=0.5 means half
-        text_norm = text_result.to(residual_dtype).norm()
-        ip_norm = ip_out.to(residual_dtype).norm()
-        if ip_norm > 0:
-            ip_out = ip_out * (text_norm / ip_norm)
-        x_B_T_H_W_D = gate.to(residual_dtype) * (text_result.to(residual_dtype) + weight * ip_out.to(residual_dtype)) + x_B_T_H_W_D
-    else:
-        # Identical to original Block.forward
-        x_B_T_H_W_D = gate.to(residual_dtype) * text_result.to(residual_dtype) + x_B_T_H_W_D
-
-    # 3. MLP (identical to original)
+    # 3. MLP
     normed = _fn(x_B_T_H_W_D, block.layer_norm_mlp, sc3, s3)
     result = block.mlp(normed.to(compute_dtype))
     x_B_T_H_W_D = x_B_T_H_W_D + rearrange(g3, "b t d -> b t 1 1 d").to(residual_dtype) * result.to(residual_dtype)
+
+    # 4. IP AdaLN modulation (after full block, within [start_at, end_at])
+    if start_at <= current_sigma <= end_at and weight > 0:
+        ip_adapter = _move_to_match(ip_adapter, x_B_T_H_W_D.device, compute_dtype)
+        vl_emb_moved = _move_to_match(vl_emb, x_B_T_H_W_D.device, x_B_T_H_W_D.dtype)
+        # Expand VL emb to match batch size (CFG uses B=2)
+        if vl_emb_moved.shape[0] < B:
+            vl_emb_moved = vl_emb_moved.expand(B, -1)
+        ip_scale, ip_shift = ip_adapter.get_modulation(block_idx, vl_emb_moved)
+        ip_scale = ip_scale.to(residual_dtype).reshape(B, 1, 1, 1, D)
+        ip_shift = ip_shift.to(residual_dtype).reshape(B, 1, 1, 1, D)
+        x_B_T_H_W_D = x_B_T_H_W_D * (1.0 + weight * ip_scale) + weight * ip_shift
 
     return x_B_T_H_W_D
 
 
 class IPAdapterHook:
-    """Hooks into Anima's DiT to inject IP-Adapter during sampling."""
+    """Hooks into Anima's DiT to inject IP-Adapter AdaLN modulation during sampling."""
 
-    def __init__(self, ip_adapter, image_tokens, weight, start_at, end_at):
+    def __init__(self, ip_adapter, vl_emb, weight, start_at, end_at):
         self.ip_adapter = ip_adapter
-        self.image_tokens = image_tokens
+        self.vl_emb = vl_emb
         self.weight = weight
         self.start_at = start_at
         self.end_at = end_at
@@ -139,7 +128,7 @@ class IPAdapterHook:
                         current_sigma = 1.0  # fallback: always apply
 
                     return _block_forward_with_ip(
-                        blk, idx, self.ip_adapter, self.image_tokens,
+                        blk, idx, self.ip_adapter, self.vl_emb,
                         self.weight, self.start_at, self.end_at, current_sigma,
                         x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs,
                     )
@@ -177,34 +166,47 @@ class AnimaIPAdapterLoader:
         state = load_file(ipadapter_path)
 
         # Auto-detect architecture from state dict
-        num_blocks = max(int(k.split(".")[1]) for k in state if k.startswith("ip_cross_attns.")) + 1
-        ip_dim = state["ip_cross_attns.0.q_proj.weight"].shape[0]
-        num_ip_heads = ip_dim // 64  # head_dim=64
+        # v4 (AdaLN): has block_mods.0.proj.weight
+        # v3 (MLP projector): has token_projector.proj_up.weight
+        # v1/v2 (Perceiver): has resampler.latents
+        # v1 (cross-attn): has ip_cross_attns.0.q_proj.weight
 
-        # Detect v3 (MLP projector) vs v1/v2 (Perceiver)
-        if "token_projector.proj_up.weight" in state:
-            # v3: MLP Token Projector
+        num_blocks = None
+        if "block_mods.0.proj.weight" in state:
+            # v4: AdaLN modulation
+            vl_dim = state["block_mods.0.proj.weight"].shape[1]
+            modulation_hidden = state["block_mods.0.proj.weight"].shape[0]
+            block_dim = state["block_mods.0.mod.weight"].shape[0] // 2
+            num_blocks = sum(1 for k in state if k.startswith("block_mods.") and k.endswith(".proj.weight"))
+            ip_adapter = IPAdapter(
+                vl_dim=vl_dim, block_dim=block_dim, num_blocks=num_blocks,
+                modulation_hidden=modulation_hidden,
+            )
+        elif "token_projector.proj_up.weight" in state:
+            # v3: MLP Token Projector (cross-attn) — backward compat
+            num_blocks = max(int(k.split(".")[1]) for k in state if k.startswith("ip_cross_attns.")) + 1
             num_tokens = state["token_projector.proj_down.weight"].shape[0]
             emb_dim = state["token_projector.proj_down.weight"].shape[1]
-            proj_up_shape = state["token_projector.proj_up.weight"].shape
-            hidden_dim = proj_up_shape[0]
+            hidden_dim = state["token_projector.proj_up.weight"].shape[0]
             mlp_hidden_mult = hidden_dim // (num_tokens * emb_dim)
             ip_adapter = IPAdapter(
-                emb_dim=emb_dim, x_dim=2048, num_blocks=num_blocks,
-                ip_dim=ip_dim, num_ip_heads=num_ip_heads, ip_head_dim=64,
-                num_tokens=num_tokens, mlp_hidden_mult=mlp_hidden_mult,
+                vl_dim=emb_dim, block_dim=2048, num_blocks=num_blocks,
+                modulation_hidden=256,
+            )
+            # v3 uses different architecture, can't load into v4
+            raise RuntimeError(
+                "v3 checkpoint format is not compatible with v4 AdaLN architecture. "
+                "Please use a v4 checkpoint or revert to an older version of the nodes."
             )
         elif "resampler.latents" in state:
-            # v1/v2: Perceiver Resampler
-            num_tokens = state["resampler.latents"].shape[0]
-            emb_dim = state["resampler.latents"].shape[1]
-            ip_adapter = IPAdapter(
-                emb_dim=emb_dim, x_dim=2048, num_blocks=num_blocks,
-                ip_dim=ip_dim, num_ip_heads=num_ip_heads, ip_head_dim=64,
-                num_tokens=num_tokens, mlp_hidden_mult=4,
+            # v1/v2: Perceiver — backward compat
+            raise RuntimeError(
+                "v1/v2 checkpoint format is not compatible with v4 AdaLN architecture. "
+                "Please use a v4 checkpoint or revert to an older version of the nodes."
             )
         else:
-            raise KeyError("Unknown checkpoint format — neither token_projector nor resampler.latents found")
+            raise KeyError("Unknown checkpoint format — cannot detect architecture")
+
         ip_adapter.load_state_dict(state)
         ip_adapter.eval()
         for p in ip_adapter.parameters():
@@ -238,19 +240,21 @@ class AnimaIPAdapterApply:
         dtype = dit.dtype
         device = next(dit.parameters()).device
 
-        # Move ipadapter to model's dtype and device before resample
+        # Move ipadapter to model's dtype and device
         ipadapter = ipadapter.to(dtype=dtype, device=device)
 
-        # Resample embedding → image tokens
+        # Prepare VL embedding: [1, 1024]
         with torch.no_grad():
             if image_emb.ndim == 1:
-                image_emb = image_emb.unsqueeze(0)  # [1, 1024]
-            if image_emb.ndim == 2:
-                image_emb = image_emb.unsqueeze(1)  # [1, 1, 1024]
-            image_tokens = ipadapter.resample(image_emb.to(dtype=dtype, device=device))  # [1, 16, 1024]
+                vl_emb = image_emb.unsqueeze(0)  # [1, 1024]
+            elif image_emb.ndim == 3:
+                vl_emb = image_emb.squeeze(1)  # [1, 1, 1024] → [1, 1024]
+            else:
+                vl_emb = image_emb  # [1, 1024] or [B, 1024]
+            vl_emb = vl_emb.to(dtype=dtype, device=device)
 
-        # Hook into model — pass the moved ipadapter to hook
-        hook = IPAdapterHook(ipadapter, image_tokens, weight, start_at, end_at)
+        # Hook into model
+        hook = IPAdapterHook(ipadapter, vl_emb, weight, start_at, end_at)
         hook.attach(model)
 
         # Store hook for cleanup
