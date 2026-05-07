@@ -397,12 +397,48 @@ class AnimaQwenVLEncodeImage:
         return (result,)
 
 
+class AnimaCCIPEncodeImage:
+    """Extract 768-dim CCIP feature from a reference image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("ANIMA_IMAGE_EMB",)
+    FUNCTION = "encode"
+    CATEGORY = "anima_ipadapter"
+
+    def encode(self, image):
+        from imgutils.metrics.ccip import ccip_batch_extract_features
+        from PIL import Image as PILImage
+
+        # ComfyUI IMAGE: [B, H, W, 3] float [0,1] → PIL
+        if image.ndim == 4:
+            batch = image
+        else:
+            batch = image.unsqueeze(0)
+
+        pil_imgs = []
+        for i in range(batch.shape[0]):
+            img_np = (batch[i].cpu().numpy() * 255).clip(0, 255).astype("uint8")
+            pil_imgs.append(PILImage.fromarray(img_np))
+
+        feats = ccip_batch_extract_features(pil_imgs)  # [B, 768]
+        result = torch.from_numpy(feats).float()
+        return (result,)
+
+
 NODE_CLASS_MAPPINGS = {
     "AnimaIPAdapterLoader": AnimaIPAdapterLoader,
     "AnimaIPAdapterApply": AnimaIPAdapterApply,
     "AnimaImageEmbLoader": AnimaImageEmbLoader,
     "AnimaQwenVLLoader": AnimaQwenVLLoader,
     "AnimaQwenVLEncodeImage": AnimaQwenVLEncodeImage,
+    "AnimaCCIPEncodeImage": AnimaCCIPEncodeImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -411,4 +447,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AnimaImageEmbLoader": "Anima Image Embedding Loader",
     "AnimaQwenVLLoader": "Anima Qwen3-VL Loader",
     "AnimaQwenVLEncodeImage": "Anima Qwen3-VL Encode Image",
+    "AnimaCCIPEncodeImage": "Anima CCIP Encode Image",
 }

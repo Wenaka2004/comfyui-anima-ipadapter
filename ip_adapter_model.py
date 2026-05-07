@@ -35,7 +35,7 @@ class IPAdapter(nn.Module):
 
     def __init__(
         self,
-        vl_dim=1024,
+        vl_dim=768,
         block_dim=2048,
         num_blocks=28,
         modulation_hidden=256,
