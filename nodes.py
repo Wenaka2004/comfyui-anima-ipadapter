@@ -432,7 +432,7 @@ class AnimaCCIPEncodeImage:
                 models.append(entry)
         # Also check root onnx dir for model_feat.onnx
         if os.path.exists(os.path.join(onnx_dir, "model_feat.onnx")):
-            models.append(".")  # dot = root dir
+            models.append("(root) model_feat.onnx")
         return models if models else ["none"]
 
     def _get_session(self, model_name):
@@ -442,7 +442,7 @@ class AnimaCCIPEncodeImage:
         import onnxruntime
         import folder_paths
 
-        if model_name == ".":
+        if model_name in ("(root) model_feat.onnx", "."):
             model_path = os.path.join(folder_paths.models_dir, "onnx", "model_feat.onnx")
         else:
             model_path = os.path.join(folder_paths.models_dir, "onnx", model_name, "model_feat.onnx")
