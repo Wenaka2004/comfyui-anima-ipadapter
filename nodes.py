@@ -425,10 +425,14 @@ class AnimaCCIPEncodeImage:
         if not os.path.isdir(onnx_dir):
             return ["none"]
         models = []
+        # Check subdirectories for model_feat.onnx
         for entry in os.listdir(onnx_dir):
             path = os.path.join(onnx_dir, entry)
             if os.path.isdir(path) and os.path.exists(os.path.join(path, "model_feat.onnx")):
                 models.append(entry)
+        # Also check root onnx dir for model_feat.onnx
+        if os.path.exists(os.path.join(onnx_dir, "model_feat.onnx")):
+            models.append(".")  # dot = root dir
         return models if models else ["none"]
 
     def _get_session(self, model_name):
@@ -438,8 +442,10 @@ class AnimaCCIPEncodeImage:
         import onnxruntime
         import folder_paths
 
-        model_dir = os.path.join(folder_paths.models_dir, "onnx", model_name)
-        model_path = os.path.join(model_dir, "model_feat.onnx")
+        if model_name == ".":
+            model_path = os.path.join(folder_paths.models_dir, "onnx", "model_feat.onnx")
+        else:
+            model_path = os.path.join(folder_paths.models_dir, "onnx", model_name, "model_feat.onnx")
 
         providers = onnxruntime.get_available_providers()
         if "CUDAExecutionProvider" in providers:
