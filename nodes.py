@@ -398,13 +398,19 @@ class AnimaQwenVLEncodeImage:
 
 
 class AnimaCCIPEncodeImage:
-    """Extract 768-dim CCIP feature from a reference image."""
+    """Extract 768-dim CCIP feature from a reference image.
+
+    Uses local ONNX model from ComfyUI/models/onnx/ccip-caformer-24-randaug-pruned/
+    """
+
+    _sessions = {}
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
+                "ccip_model": (cls.list_models(), {"tooltip": "CCIP ONNX model folder under models/onnx/"}),
             }
         }
 
@@ -412,24 +418,67 @@ class AnimaCCIPEncodeImage:
     FUNCTION = "encode"
     CATEGORY = "anima_ipadapter"
 
-    def encode(self, image):
-        from imgutils.metrics.ccip import ccip_batch_extract_features
+    @staticmethod
+    def list_models():
+        import folder_paths
+        onnx_dir = os.path.join(folder_paths.models_dir, "onnx")
+        if not os.path.isdir(onnx_dir):
+            return ["none"]
+        models = []
+        for entry in os.listdir(onnx_dir):
+            path = os.path.join(onnx_dir, entry)
+            if os.path.isdir(path) and os.path.exists(os.path.join(path, "model_feat.onnx")):
+                models.append(entry)
+        return models if models else ["none"]
+
+    def _get_session(self, model_name):
+        if model_name in self._sessions:
+            return self._sessions[model_name]
+
+        import onnxruntime
+        import folder_paths
+
+        model_dir = os.path.join(folder_paths.models_dir, "onnx", model_name)
+        model_path = os.path.join(model_dir, "model_feat.onnx")
+
+        providers = onnxruntime.get_available_providers()
+        if "CUDAExecutionProvider" in providers:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        sess = onnxruntime.InferenceSession(model_path, providers=providers)
+        self._sessions[model_name] = sess
+        return sess
+
+    def encode(self, image, ccip_model):
+        import numpy as np
+        import onnxruntime
         from PIL import Image as PILImage
 
-        # ComfyUI IMAGE: [B, H, W, 3] float [0,1] → PIL
+        if ccip_model == "none":
+            raise RuntimeError("No CCIP model found. Download from https://huggingface.co/deepghs/ccip_onnx "
+                             "and place model_feat.onnx in ComfyUI/models/onnx/ccip-caformer-24-randaug-pruned/")
+
+        # ComfyUI IMAGE: [B, H, W, 3] float [0,1] → preprocessed tensor
         if image.ndim == 4:
             batch = image
         else:
             batch = image.unsqueeze(0)
 
-        pil_imgs = []
-        for i in range(batch.shape[0]):
+        B = batch.shape[0]
+        # Resize to 384x384 and normalize (ImageNet stats)
+        preprocessed = torch.zeros(B, 3, 384, 384, dtype=torch.float32)
+        for i in range(B):
             img_np = (batch[i].cpu().numpy() * 255).clip(0, 255).astype("uint8")
-            pil_imgs.append(PILImage.fromarray(img_np))
+            pil = PILImage.fromarray(img_np).resize((384, 384), PILImage.LANCZOS)
+            arr = np.array(pil, dtype=np.float32) / 255.0
+            # ImageNet normalization
+            arr = (arr - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
+            preprocessed[i] = torch.from_numpy(arr.transpose(2, 0, 1))
 
-        feats = ccip_batch_extract_features(pil_imgs)  # [B, 768]
-        result = torch.from_numpy(feats).float()
-        return (result,)
+        # ONNX inference
+        sess = self._get_session(ccip_model)
+        input_name = sess.get_inputs()[0].name
+        feats = sess.run(None, {input_name: preprocessed.numpy()})[0]  # [B, 768]
+        return (torch.from_numpy(feats).float(),)
 
 
 NODE_CLASS_MAPPINGS = {
