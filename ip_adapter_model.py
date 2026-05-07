@@ -63,5 +63,9 @@ class IPAdapter(nn.Module):
         if vl_emb.dim() == 3 and vl_emb.shape[1] == 1:
             vl_emb = vl_emb.squeeze(1)
         scale, shift = self.block_mods[block_idx](vl_emb)
+        # Normalize: clip scale L2 norm to <= 1.0 so modulation doesn't explode
+        scale_norm = scale.norm(dim=-1, keepdim=True).clamp(min=1.0)
+        scale = scale / scale_norm
+        shift = shift / scale_norm
         s = self.ip_scales[block_idx]
         return s * scale, s * shift
