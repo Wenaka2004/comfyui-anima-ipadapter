@@ -1,10 +1,11 @@
-"""IP-Adapter for Anima DiT with SigLIP2 image encoder.
+"""IP-Adapter for Anima DiT — v3 InstantCharacter-style.
 
-Architecture inspired by InstantCharacter:
-1. SigLIP2 extracts patch features [B, N_patches, 768]
-2. TimeResampler (Perceiver + timestep AdaLN): 768 → 2048-dim tokens
-3. Per DiT block: to_k_ip/to_v_ip with RMSNorm, reuse text cross-attn query
-4. Injection: text_attn_output + scale * ip_attn_output (no magnitude hack)
+Architecture per arXiv:2504.12395:
+1. General vision encoder: SigLIP2 (deep + shallow features)
+2. Intermediate encoder: cross-layer transformer (shallow→deep fusion)
+3. Projection head: TimeResampler (timestep-aware Perceiver with AdaLN)
+4. Per DiT block: IPCrossAttn with RMSNorm on Q/K
+5. Injection: text_attn_out + scale * ip_attn_out
 """
 
 import math
@@ -27,7 +28,46 @@ class RMSNorm(nn.Module):
         return self.scale * x_normed
 
 
-# ─── TimeResampler ──────────────────────────────────────────────────
+# ─── Intermediate Encoder (Cross-Layer Fusion) ──────────────────────
+
+class CrossLayerEncoder(nn.Module):
+    """Fuses shallow + deep features from vision encoder via cross-attention.
+
+    Per InstantCharacter paper §3.1: "each feature pathway is independently
+    processed by a separate transformer encoder to integrate with high-level
+    semantic features."
+    """
+    def __init__(self, shallow_dim, deep_dim, hidden_dim, num_layers=4, num_heads=16):
+        super().__init__()
+        # Project both streams to hidden_dim
+        self.shallow_proj = nn.Linear(shallow_dim, hidden_dim, bias=False)
+        self.deep_proj = nn.Linear(deep_dim, hidden_dim, bias=False)
+        self.norm_shallow = RMSNorm(hidden_dim)
+        self.norm_deep = RMSNorm(hidden_dim)
+
+        # Cross-layer transformer: shallow features attend to deep features
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
+            dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.cross_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
+                dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
+            ) for _ in range(num_layers)
+        ])
+
+    def forward(self, shallow_features, deep_features):
+        """shallow: [B, N1, C1], deep: [B, N2, C2] → [B, N1+N2, hidden_dim]"""
+        s = self.norm_shallow(self.shallow_proj(shallow_features))
+        d = self.norm_deep(self.deep_proj(deep_features))
+        # Cross-attention: shallow queries attend to deep keys/values
+        for layer in self.cross_layers:
+            s = layer(s, memory=d)
+        return torch.cat([s, d], dim=1)
+
+
+# ─── TimeResampler (Projection Head) ────────────────────────────────
 
 class PerceiverAttention(nn.Module):
     def __init__(self, dim, dim_head=64, heads=16):
@@ -35,7 +75,6 @@ class PerceiverAttention(nn.Module):
         self.heads = heads
         self.dim_head = dim_head
         inner_dim = dim_head * heads
-        self.scale = dim_head ** -0.5
 
         self.norm_kv = nn.LayerNorm(dim)
         self.norm_q = nn.LayerNorm(dim)
@@ -44,33 +83,27 @@ class PerceiverAttention(nn.Module):
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
     def forward(self, x, latents, shift=None, scale=None):
-        """x: image features [B, N, dim], latents: [B, Nq, dim]"""
         x = self.norm_kv(x)
         latents = self.norm_q(latents)
-
         if shift is not None and scale is not None:
             latents = latents * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
         B, L, _ = latents.shape
         q = self.to_q(latents)
         kv_input = torch.cat([x, latents], dim=1)
         k, v = self.to_kv(kv_input).chunk(2, dim=-1)
-
         q = q.view(B, L, self.heads, -1).transpose(1, 2)
         k = k.view(B, k.shape[1], self.heads, -1).transpose(1, 2)
         v = v.view(B, v.shape[1], self.heads, -1).transpose(1, 2)
-
         out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, L, -1)
         return self.to_out(out)
 
 
 class TimeResampler(nn.Module):
-    """Perceiver resampler with timestep conditioning via AdaLN.
+    """Timestep-aware Q-Former (Projection Head per §3.1).
 
-    Key difference from vanilla Perceiver: timestep embedding modulates
-    the latent tokens via shift/scale in each layer, so the output
-    image tokens adapt to the current denoising step.
+    Processes intermediate encoder outputs as KV, learnable queries via
+    Perceiver attention with AdaLN timestep conditioning.
     """
     def __init__(self, input_dim=768, dim=1024, output_dim=2048,
                  num_queries=32, depth=4, dim_head=64, heads=16,
@@ -82,13 +115,11 @@ class TimeResampler(nn.Module):
         self.proj_out = nn.Linear(dim, output_dim, bias=False)
         self.norm_out = nn.LayerNorm(output_dim)
 
-        # Timestep embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(time_embed_dim, dim),
             nn.SiLU(),
             nn.Linear(dim, dim),
         )
-        # Sinusoidal timestep projection
         self.time_proj = nn.Linear(1, time_embed_dim)
 
         self.layers = nn.ModuleList([])
@@ -101,13 +132,10 @@ class TimeResampler(nn.Module):
                     nn.GELU(),
                     nn.Linear(dim * ff_mult, dim, bias=False),
                 ),
-                # AdaLN modulation: shift_msa, scale_msa, shift_ff, scale_ff
                 nn.Sequential(nn.SiLU(), nn.Linear(dim, 4 * dim, bias=True)),
             ]))
 
     def _embed_timestep(self, t):
-        """t: [B] timestep values in [0, 1]"""
-        # Simple sinusoidal + MLP
         half_dim = self.time_proj.out_features // 2
         freqs = torch.exp(-math.log(10000) * torch.arange(half_dim, device=t.device, dtype=t.dtype) / half_dim)
         args = t[:, None].float() * freqs[None]
@@ -117,18 +145,14 @@ class TimeResampler(nn.Module):
         return self.time_mlp(emb)
 
     def forward(self, x, timestep):
-        """x: [B, N, input_dim], timestep: [B] in [0,1] → [B, Nq, output_dim]"""
         B = x.shape[0]
         x = self.proj_in(x)
         latents = self.latents.expand(B, -1, -1)
-
         temb = self._embed_timestep(timestep)
 
         for attn, ff, adaLN_mod in self.layers:
             shift_msa, scale_msa, shift_ff, scale_ff = adaLN_mod(temb).chunk(4, dim=1)
-            # Perceiver attention with AdaLN on latents
             latents = attn(x, latents, shift=shift_msa, scale=scale_msa) + latents
-            # FFN with AdaLN (matching InstantCharacter)
             res = latents
             for i, layer in enumerate(ff):
                 latents = layer(latents)
@@ -142,39 +166,24 @@ class TimeResampler(nn.Module):
 # ─── Per-Block IP Cross-Attention ───────────────────────────────────
 
 class IPCrossAttn(nn.Module):
-    """Per-block IP attention with RMSNorm on Q and K (InstantCharacter-style).
-
-    Key differences from our old design:
-    - RMSNorm on ip_q and ip_k for stable attention computation
-    - Full-dim to_k_ip / to_v_ip (no bottleneck)
-    - No output_proj (just add directly)
-    - No magnitude normalization needed — RMSNorm handles scale matching
-    """
+    """Per-block IP attention with RMSNorm on Q and K (InstantCharacter-style)."""
     def __init__(self, hidden_size=2048, ip_hidden_dim=2048, num_heads=16):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads  # 128
-
+        self.head_dim = hidden_size // num_heads
         self.norm_ip_q = RMSNorm(self.head_dim, eps=1e-6)
         self.norm_ip_k = RMSNorm(self.head_dim, eps=1e-6)
-
         self.to_k_ip = nn.Linear(ip_hidden_dim, hidden_size, bias=False)
         self.to_v_ip = nn.Linear(ip_hidden_dim, hidden_size, bias=False)
 
     def forward(self, q_text, ip_hidden_states):
-        """q_text: [B, S, hidden_size], ip_hidden_states: [B, Nq, ip_hidden_dim]"""
         B, S, D = q_text.shape
         L = ip_hidden_states.shape[1]
-
-        # Q from text cross-attn query (reuse, like InstantCharacter)
         q = q_text.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         q = self.norm_ip_q(q)
-
-        # K, V from IP hidden states
         ip_k = self.to_k_ip(ip_hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         ip_k = self.norm_ip_k(ip_k)
         ip_v = self.to_v_ip(ip_hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-
         out = F.scaled_dot_product_attention(q, ip_k, ip_v)
         out = out.transpose(1, 2).reshape(B, S, D)
         return out
@@ -183,34 +192,50 @@ class IPCrossAttn(nn.Module):
 # ─── IP-Adapter Module ──────────────────────────────────────────────
 
 class IPAdapterSigLIP(nn.Module):
-    """IP-Adapter with SigLIP2 + TimeResampler + per-block IP cross-attn.
+    """IP-Adapter with CrossLayerEncoder + TimeResampler + IPCrossAttn.
 
-    Architecture (InstantCharacter-inspired):
-    - TimeResampler: SigLIP features → timestep-aware image tokens
-    - Per-block IPCrossAttn: RMSNorm-stabilized attention, no bottleneck
-    - Injection: text_attn_out + scale * ip_attn_out
+    Per InstantCharacter (arXiv:2504.12395):
+    1. General vision encoder: SigLIP2 deep + shallow features
+    2. Intermediate encoder: CrossLayerEncoder (shallow→deep cross-attention fusion)
+    3. Projection head: TimeResampler (timestep-aware Perceiver with AdaLN)
+    4. Per-block IPCrossAttn with RMSNorm
     """
-    def __init__(self, input_dim=768, dit_dim=2048, num_blocks=28,
+    def __init__(self, siglip_dim=768, siglip_shallow_dim=768,
+                 dit_dim=2048, num_blocks=28,
                  num_queries=32, resampler_depth=4, resampler_heads=16,
                  resampler_dim=1024, resampler_dim_head=64,
-                 ip_heads=16, time_embed_dim=320):
+                 intermediate_dim=768, intermediate_layers=4, intermediate_heads=12,
+                 ip_heads=16, time_embed_dim=320,
+                 use_intermediate_encoder=True):
         super().__init__()
         self.num_blocks = num_blocks
         self.num_queries = num_queries
+        self.use_intermediate_encoder = use_intermediate_encoder
 
-        # TimeResampler
+        if use_intermediate_encoder:
+            # Intermediate encoder: fuse shallow + deep SigLIP features
+            self.intermediate_encoder = CrossLayerEncoder(
+                shallow_dim=siglip_shallow_dim, deep_dim=siglip_dim,
+                hidden_dim=intermediate_dim, num_layers=intermediate_layers,
+                num_heads=intermediate_heads,
+            )
+            resampler_input_dim = intermediate_dim * 2  # cat(shallow, deep) after projection
+        else:
+            self.intermediate_encoder = None
+            resampler_input_dim = siglip_dim
+
+        # Projection head: TimeResampler
         self.resampler = TimeResampler(
-            input_dim=input_dim, dim=resampler_dim,
+            input_dim=resampler_input_dim, dim=resampler_dim,
             output_dim=dit_dim, num_queries=num_queries,
             depth=resampler_depth, dim_head=resampler_dim_head,
             heads=resampler_heads, ff_mult=4,
             time_embed_dim=time_embed_dim,
         )
 
-        # Per-block IP cross-attention (full-dim, with RMSNorm)
+        # Per-block IP cross-attention
         self.ip_cross_attns = nn.ModuleList([
-            IPCrossAttn(hidden_size=dit_dim, ip_hidden_dim=dit_dim,
-                        num_heads=ip_heads)
+            IPCrossAttn(hidden_size=dit_dim, ip_hidden_dim=dit_dim, num_heads=ip_heads)
             for _ in range(num_blocks)
         ])
 
@@ -220,16 +245,26 @@ class IPAdapterSigLIP(nn.Module):
             for _ in range(num_blocks)
         ])
 
-    def encode_ref(self, siglip_features, timestep=None):
-        """SigLIP features → image tokens. timestep: [B] in [0,1]."""
+    def encode_ref(self, siglip_features, timestep=None, shallow_features=None):
+        """SigLIP features → image tokens.
+
+        Args:
+            siglip_features: deep features [B, N_deep, 768]
+            timestep: [B] in [0,1]
+            shallow_features: shallow features [B, N_shallow, 768] (optional)
+        """
         if timestep is None:
-            # Default to t=0.5 if not provided (midpoint)
             B = siglip_features.shape[0]
             timestep = torch.full((B,), 0.5, device=siglip_features.device, dtype=siglip_features.dtype)
-        return self.resampler(siglip_features, timestep)
+
+        if self.use_intermediate_encoder and shallow_features is not None:
+            x = self.intermediate_encoder(shallow_features, siglip_features)
+        else:
+            x = siglip_features
+
+        return self.resampler(x, timestep)
 
     def forward_block(self, block_idx, query, image_tokens, scale_override=None):
-        """IP cross-attention for one DiT block."""
         ip_out = self.ip_cross_attns[block_idx](query, image_tokens)
         scale = scale_override if scale_override is not None else self.ip_scales[block_idx]
         return scale * ip_out
