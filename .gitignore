@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+slurm-*.out
+*.out
+diag_*.py
+test_*.py

@@ -1,10 +1,17 @@
-"""Train IPA (cross-attn injection) with kohya-ss model class."""
+"""Train IPA (cross-attn injection) with kohya-ss model class.
+
+InstantCharacter-inspired design:
+- TimeResampler: timestep-conditioned Perceiver with AdaLN
+- IPCrossAttn: RMSNorm on Q/K, full-dim projections, no bottleneck
+- Injection: text_attn_out + scale * ip_attn_out (no magnitude hack)
+- Text dropout uses unconditional embedding
+- Image token dropout (10%)
+"""
 import argparse, io, json, os, sys, time
 from pathlib import Path
 import torch, torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from safetensors.torch import save_file
-from einops import rearrange
 
 ROOT = Path("/data/stardust/anima_ipa")
 sys.path.insert(0, str(ROOT / "sd-scripts"))
@@ -54,10 +61,11 @@ class TrainDataset(Dataset):
         return {"ref_img_bytes": ref_bytes, "img": img_t, "prompt": p["prompt"]}
 
 
-def flow_match_sample(x1, t):
+def flow_match_sample(x1, sigma):
+    """Match kohya convention: sigma=0 clean, sigma=1 noise."""
     x0 = torch.randn_like(x1)
-    tr = t.reshape(-1, *([1]*(x1.ndim-1)))
-    return (1-tr)*x0 + tr*x1, x1-x0
+    sr = sigma.reshape(-1, *([1]*(x1.ndim-1)))
+    return (1-sr)*x1 + sr*x0, x0-x1
 
 
 def train(args):
@@ -66,7 +74,7 @@ def train(args):
 
     # DiT
     print("[1/5] DiT...", flush=True)
-    anima = anima_utils.load_anima_model(dev1, f"{ROOT}/stage7_train/models/anima-preview3-base.safetensors",
+    anima = anima_utils.load_anima_model(dev1, f"{ROOT}/stage7_train/models_v1/anima-base-v1.0.safetensors",
         "torch", True, dev1, dtype, False)
     anima = anima.to(dev1, dtype=dtype).eval().requires_grad_(False)
 
@@ -81,6 +89,15 @@ def train(args):
     strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
     encoding_strategy = strategy_anima.AnimaTextEncodingStrategy()
     strategy_base.TextEncodingStrategy.set_strategy(encoding_strategy)
+
+    # Pre-compute unconditional text embedding
+    print("  Computing unconditional text embedding...", flush=True)
+    tn = tokenize_strategy.tokenize("")
+    en = encoding_strategy.encode_tokens(tokenize_strategy, [te_model], tn)
+    uncond_emb = anima._preprocess_text_embeds(en[0].to(dev1), en[2].to(dev1), en[3].to(dev1), en[1].to(dev1))
+    uncond_emb[~en[3].to(dev1).bool()] = 0
+    if uncond_emb.shape[1] < 512:
+        uncond_emb = F.pad(uncond_emb, (0,0,0,512-uncond_emb.shape[1]))
 
     # SigLIP
     print("[3/5] SigLIP...", flush=True)
@@ -101,17 +118,20 @@ def train(args):
     # IPA
     print("[5/5] IPA...", flush=True)
     ipa = IPAdapterSigLIP(input_dim=768, dit_dim=2048, num_blocks=28,
-        num_queries=32, resampler_depth=2, resampler_heads=16,
-        resampler_internal=1024, ip_heads=16, ip_bottleneck=256)
+        num_queries=32, resampler_depth=4, resampler_heads=16,
+        resampler_dim=1024, resampler_dim_head=64,
+        ip_heads=16, time_embed_dim=320)
     ipa.to(dev1, dtype=dtype)
     print(f"  {sum(p.numel() for p in ipa.parameters())/1e6:.1f}M", flush=True)
 
-    # Separate optimizer: ip_scales get ultra-low LR (they're 28 scalars, grow too fast)
-    ip_scale_params = list(ipa.ip_scales)
-    other_params = [p for n, p in ipa.named_parameters() if not n.startswith("ip_scales")]
+    # Separate param groups: ip_scales with 10x LR
+    resampler_params = [p for n, p in ipa.named_parameters() if n.startswith("resampler.")]
+    ipca_params = [p for n, p in ipa.named_parameters() if n.startswith("ip_cross_attns.")]
+    ip_scale_params = [p for n, p in ipa.named_parameters() if n.startswith("ip_scales.")]
     opt = torch.optim.AdamW([
-        {"params": other_params, "lr": args.lr},
-        {"params": ip_scale_params, "lr": 1e-5},  # 100x smaller
+        {"params": resampler_params, "lr": args.lr},
+        {"params": ipca_params, "lr": args.lr},
+        {"params": ip_scale_params, "lr": args.lr * 10},
     ], weight_decay=0.01)
 
     dataset = TrainDataset(args.pairs_path, args.image_dir, max_pairs=args.max_pairs)
@@ -131,6 +151,9 @@ def train(args):
     ipa.train()
     print(f"\n{args.num_steps} steps, lr={args.lr}, bs={args.batch_size}\n", flush=True)
 
+    # Record initial params for delta tracking
+    init_params = {n: p.data.clone() for n, p in ipa.named_parameters()}
+
     def sample_image(ref_pils, prompt, step):
         if not ref_pils or ref_pils[0] is None: return None
         try:
@@ -139,74 +162,55 @@ def train(args):
             si = siglip_proc(images=rp, return_tensors="pt", do_resize=False)
             si = {k: v.to(dev0, dtype=dtype) for k, v in si.items()}
             with torch.no_grad(): sf = siglip(**si).last_hidden_state.to(dev1, dtype=dtype)
-            it = ipa.encode_ref(sf)
-            # Text
+            # Encode text
             tokens = tokenize_strategy.tokenize(prompt)
             emb = encoding_strategy.encode_tokens(tokenize_strategy, [te_model], tokens)
             ce = anima._preprocess_text_embeds(emb[0].to(dev1), emb[2].to(dev1), emb[3].to(dev1), emb[1].to(dev1))
             ce[~emb[3].to(dev1).bool()] = 0
-            # Encode negative
-            tn = tokenize_strategy.tokenize("")
-            en = encoding_strategy.encode_tokens(tokenize_strategy, [te_model], tn)
-            cn = anima._preprocess_text_embeds(en[0].to(dev1), en[2].to(dev1), en[3].to(dev1), en[1].to(dev1))
-            # Sample — patch once, run all steps, restore once
+            cn = uncond_emb.clone()
+            # Sample with IPA monkey-patch
             n_steps = 20; cfg_v = 4.5
+            _s_orig = {}
+            # For sampling, we recompute image_tokens per step since resampler is timestep-conditioned
+            # Store current image_tokens in a mutable container for the monkey-patch
+            cur_tokens = [None]
+            for idx, blk in enumerate(anima.blocks):
+                _s_orig[idx] = blk.cross_attn.forward; bi = idx
+                def _smf(ca_mod=blk.cross_attn, bidx=bi, ipa_mod=ipa):
+                    of = ca_mod.forward
+                    def _sf(x, attn_params, context=None, rope_emb=None):
+                        o = of(x, attn_params, context, rope_emb)
+                        return o + ipa_mod.forward_block(bidx, x, cur_tokens[0], scale_override=None).to(o.dtype)
+                    return _sf
+                blk.cross_attn.forward = _smf()
             tsteps, sigs = hunyuan_image_utils.get_timesteps_sigmas(n_steps, 5.0, dev1)
             tsteps = tsteps.to(dev1, dtype=dtype) / 1000
             h, w = 1024//8, 1024//8
             lat = torch.randn(1, 16, 1, h, w, device=dev1, dtype=dtype)
             pm = torch.zeros(1, 1, h, w, dtype=dtype, device=dev1)
-            # Patch once before sampling loop
-            _ipa_sample_orig = {}
-            for idx, blk in enumerate(anima.blocks):
-                _ipa_sample_orig[idx] = blk.cross_attn.forward
-                bi = idx
-                def _make_fwd2(ca_mod=blk.cross_attn, bidx=bi, ipa_mod=ipa, tok=it):
-                    of = ca_mod.forward
-                    def _fwd2(x, attn_params, context=None, rope_emb=None):
-                        o = of(x, attn_params, context, rope_emb)
-                        ipo = ipa_mod.forward_block(bidx, x, tok)
-                        return o + ipo.to(o.dtype)
-                    return _fwd2
-                blk.cross_attn.forward = _make_fwd2()
             with torch.no_grad():
                 for i, t_ in enumerate(tsteps):
                     ts = t_.expand(1).reshape(1, 1)
+                    # Recompute image_tokens for this timestep
+                    cur_tokens[0] = ipa.encode_ref(sf, timestep=ts.flatten())
                     npc = anima(lat, ts, ce, padding_mask=pm)
                     npu = anima(lat, ts, cn, padding_mask=pm)
                     lat = hunyuan_image_utils.step(lat, npu+cfg_v*(npc-npu), sigs, i).to(lat.dtype)
-            # Restore
             for idx, blk in enumerate(anima.blocks):
-                if idx in _ipa_sample_orig:
-                    blk.cross_attn.forward = _ipa_sample_orig[idx]
-            dec = vae.decode_to_pixels(lat.to(dev0, dtype=dtype))
+                if idx in _s_orig: blk.cross_attn.forward = _s_orig[idx]
+            # Decode
+            vae.to("cpu")
+            with torch.no_grad():
+                dec = vae.decode_to_pixels(lat.cpu().to(dtype=dtype))
+            vae.to(dev0)
             if dec.ndim == 5: dec = dec.squeeze(2)
             img = dec[0].float().clamp(-1,1)
             img = ((img+1)*127.5).clamp(0,255).to(torch.uint8).cpu().numpy().transpose(1,2,0)
             ipa.train()
             return PILImage.fromarray(img)
         except Exception as e:
+            import traceback; traceback.print_exc()
             print(f"  [sample] err: {e}", flush=True); ipa.train(); return None
-
-    _ipa_ca_orig = {}
-    def _ipa_patch(blocks, ip_adapter, im_tokens):
-        for idx, block in enumerate(blocks):
-            ca = block.cross_attn
-            if idx not in _ipa_ca_orig:
-                _ipa_ca_orig[idx] = ca.forward
-            bi = idx
-            def make_fwd(ca_mod=ca, bidx=bi, ip=ip_adapter, tok=im_tokens):
-                orig_fwd = ca_mod.forward
-                def new_fwd(x, attn_params, context=None, rope_emb=None):
-                    out = orig_fwd(x, attn_params, context, rope_emb)
-                    ip_out = ip.forward_block(bidx, x, tok)
-                    return out + ip_out.to(out.dtype)
-                return new_fwd
-            ca.forward = make_fwd()
-    def _ipa_restore(blocks):
-        for idx, block in enumerate(blocks):
-            if idx in _ipa_ca_orig:
-                block.cross_attn.forward = _ipa_ca_orig[idx]
 
     while global_step < args.num_steps:
         batch = next_batch()
@@ -219,17 +223,23 @@ def train(args):
         si = siglip_proc(images=rp, return_tensors="pt", do_resize=False)
         si = {k: v.to(dev0, dtype=dtype) for k, v in si.items()}
         with torch.no_grad(): sf = siglip(**si).last_hidden_state.to(dev1, dtype=dtype)
-        image_tokens = ipa.encode_ref(sf)
 
-        # 2. VAE
+        # 2. VAE encode
         with torch.no_grad():
-            x1 = vae.encode(batch["img"].to(dev0, dtype=dtype))["latent_dist"].sample().to(dev1, dtype=dtype)
+            x1 = vae.encode_pixels_to_latents(batch["img"].to(dev0, dtype=dtype)).to(dev1, dtype=dtype)
 
         # 3. Flow match
-        t = torch.rand(B, device=dev1, dtype=dtype)
-        xt, target = flow_match_sample(x1, t)
+        sigma = torch.rand(B, device=dev1, dtype=dtype)
+        xt, target = flow_match_sample(x1, sigma)
 
-        # 4. Text
+        # 4. Encode ref with timestep — this is key: image_tokens are timestep-dependent
+        image_tokens = ipa.encode_ref(sf, timestep=sigma)
+
+        # Image token dropout: 10%
+        img_drop_mask = (torch.rand(B, device=dev1) > 0.1).to(dtype).view(B, 1, 1)
+        image_tokens = image_tokens * img_drop_mask
+
+        # 5. Text — 10% dropout with unconditional embedding
         text_embeds = []
         for p in prompts:
             tokens = tokenize_strategy.tokenize(p)
@@ -237,26 +247,72 @@ def train(args):
             ce = anima._preprocess_text_embeds(emb[0].to(dev1), emb[2].to(dev1), emb[3].to(dev1), emb[1].to(dev1))
             ce[~emb[3].to(dev1).bool()] = 0; text_embeds.append(ce)
         text_emb = torch.cat(text_embeds, dim=0).to(dev1, dtype=dtype)
-        # Text dropout: 20% chance to zero out text, forcing IPA to carry info
-        drop_mask = (torch.rand(B, device=dev1) > 0.2).to(dtype).view(B, 1, 1)
-        text_emb = text_emb * drop_mask
+        text_drop = (torch.rand(B, device=dev1) > 0.1).to(dtype).view(B, 1, 1)
+        text_emb = text_emb * text_drop + uncond_emb.expand_as(text_emb) * (1 - text_drop)
         if text_emb.shape[1] < 512: text_emb = F.pad(text_emb, (0,0,0,512-text_emb.shape[1]))
 
-        # 5. Forward with IPA
-        _ipa_patch(anima.blocks, ipa, image_tokens)
-        ts = (t*1000).unsqueeze(1)
+        # 6. Forward with IPA
+        ts = sigma.unsqueeze(1)
         pad_mask = torch.zeros(B, 1, xt.shape[-2], xt.shape[-1], device=dev1, dtype=dtype)
-        pred = anima(xt, ts, text_emb, padding_mask=pad_mask)
-        _ipa_restore(anima.blocks)
 
-        # 6. Loss
+        # Patch cross_attn with IPA — no magnitude normalization needed
+        # RMSNorm on Q/K in IPCrossAttn handles scale matching
+        _ipa_ca_orig = {}
+        for idx, block in enumerate(anima.blocks):
+            ca = block.cross_attn
+            _ipa_ca_orig[idx] = ca.forward
+            bi = idx
+            def make_fwd(ca_mod=ca, bidx=bi, ip=ipa, tok=image_tokens):
+                orig_fwd = ca_mod.forward
+                def new_fwd(x, attn_params, context=None, rope_emb=None):
+                    out = orig_fwd(x, attn_params, context, rope_emb)
+                    ip_out = ip.forward_block(bidx, x, tok, scale_override=None)
+                    return out + ip_out.to(out.dtype)
+                return new_fwd
+            ca.forward = make_fwd()
+
+        anima.requires_grad_(True)
+        pred = anima(xt, ts, text_emb, padding_mask=pad_mask)
+
+        # Restore
+        for idx, block in enumerate(anima.blocks):
+            if idx in _ipa_ca_orig:
+                block.cross_attn.forward = _ipa_ca_orig[idx]
+        anima.requires_grad_(False)
+
+        # 7. Loss
         loss = F.mse_loss(pred.float(), target.float())
-        opt.zero_grad(); loss.backward()
-        torch.nn.utils.clip_grad_norm_(ipa.parameters(), 1.0)
+        opt.zero_grad()
+        loss.backward()
+        for p in anima.parameters():
+            if p.grad is not None:
+                p.grad = None
+        torch.nn.utils.clip_grad_norm_(
+            resampler_params + ipca_params + ip_scale_params, 1.0)
         opt.step()
 
         global_step += 1; running_loss += loss.item(); n_loss += 1
         if args.wandb: wandb.log({"loss": loss.item(), "step": global_step})
+
+        if global_step % 100 == 1:
+            grad_norms = {}
+            for n, p in ipa.named_parameters():
+                if p.grad is not None:
+                    key = n.split(".")[0]
+                    grad_norms[key] = grad_norms.get(key, 0) + p.grad.norm().item()
+            for k, v in grad_norms.items():
+                print(f"  [grad] {k}: {v:.4f}", flush=True)
+            delta = {}
+            for n, p in ipa.named_parameters():
+                if n in init_params:
+                    d = (p.data.float() - init_params[n].float()).norm().item()
+                    key = n.split(".")[0]
+                    delta[key] = delta.get(key, 0) + d
+            for k, v in delta.items():
+                print(f"  [delta] {k}: {v:.4f}", flush=True)
+            scales = [p.item() for p in ip_scale_params]
+            print(f"  [scales] min={min(scales):.4f} max={max(scales):.4f} mean={sum(scales)/len(scales):.4f}", flush=True)
+
         if global_step % args.log_every == 0:
             print(f"step {global_step}/{args.num_steps} | loss={running_loss/n_loss:.4f} | "
                   f"rate={global_step/(time.time()-t0):.2f} steps/s", flush=True)
@@ -265,68 +321,29 @@ def train(args):
             sf_path = output_dir / f"ipa_step{global_step}.safetensors"
             save_file(ipa.state_dict(), str(sf_path))
             print(f"Saved: {sf_path}", flush=True)
-        if args.wandb and global_step % 200 == 0:
+        if args.wandb and global_step % 100 == 0:
             gen = sample_image(ref_pils, prompts[0], global_step)
             if gen:
                 try:
                     rf = ref_pils[0].resize((512,512))
                     combined = PILImage.new("RGB", (1024,512))
                     combined.paste(rf, (0,0)); combined.paste(gen.resize((512,512)), (512,0))
-                    wandb.log({"sample/ref_gen": wandb.Image(combined, caption=f"step{global_step} {prompts[0][:50]}"),
+                    sample_dir = output_dir / "samples"
+                    sample_dir.mkdir(exist_ok=True)
+                    combined.save(sample_dir / f"step{global_step:06d}.png")
+                    with open(sample_dir / f"step{global_step:06d}.txt", "w") as f: f.write(prompts[0])
+                    wandb.log({"sample/ref_gen": wandb.Image(combined, caption=prompts[0]),
                                "step": global_step})
                 except Exception: pass
         if global_step >= args.num_steps: break
     print(f"\nDone in {(time.time()-t0)/60:.1f}m", flush=True)
 
 
-def _block_ipa(orig_fwd, block, block_idx, ip_adapter, image_tokens,
-               x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
-    """Block forward with IPA cross-attn injection."""
-    residual_dtype = x_B_T_H_W_D.dtype; compute_dtype = emb_B_T_D.dtype
-    rope_emb = kwargs.get("rope_emb_L_1_1_D", None)
-    adaln_lora = kwargs.get("adaln_lora_B_T_3D", None)
-    extra_pos_emb = kwargs.get("extra_per_block_pos_emb", None)
-    use_fp32 = kwargs.get("use_fp32", False)
-
-    if extra_pos_emb is not None: x_B_T_H_W_D = x_B_T_H_W_D + extra_pos_emb
-    B, T, H, W, D = x_B_T_H_W_D.shape
-
-    # Self-attn
-    s1, sc1, g1 = (block.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora).chunk(3, dim=-1)
-    def _fn(_x, _norm, _scale, _shift):
-        return _norm(_x)*(1+rearrange(_scale,"b t d -> b t 1 1 d"))+rearrange(_shift,"b t d -> b t 1 1 d")
-    normed = _fn(x_B_T_H_W_D, block.layer_norm_self_attn, sc1, s1)
-    result = rearrange(block.self_attn(
-        rearrange(normed.to(compute_dtype),"b t h w d -> b (t h w) d"),
-        None, rope_emb=rope_emb),
-        "b (t h w) d -> b t h w d", t=T, h=H, w=W)
-    x_B_T_H_W_D = x_B_T_H_W_D + rearrange(g1,"b t d -> b t 1 1 d").to(residual_dtype)*result.to(residual_dtype)
-
-    # Cross-attn (text) + IPA
-    s2, sc2, g2 = (block.adaln_modulation_cross_attn(emb_B_T_D)+adaln_lora).chunk(3,dim=-1)
-    normed = _fn(x_B_T_H_W_D, block.layer_norm_cross_attn, sc2, s2)
-    nf = rearrange(normed.to(compute_dtype),"b t h w d -> b (t h w) d")
-    tr = rearrange(block.cross_attn(nf, crossattn_emb, rope_emb=rope_emb),
-                   "b (t h w) d -> b t h w d", t=T, h=H, w=W)
-    # IPA injection
-    ip_out = ip_adapter.forward_block(block_idx, nf, image_tokens)
-    ip_out = rearrange(ip_out, "b (t h w) d -> b t h w d", t=T, h=H, w=W)
-    gate = rearrange(g2,"b t d -> b t 1 1 d")
-    x_B_T_H_W_D = gate.to(residual_dtype)*(tr.to(residual_dtype)+ip_out.to(residual_dtype))+x_B_T_H_W_D
-
-    # MLP
-    s3, sc3, g3 = (block.adaln_modulation_mlp(emb_B_T_D)+adaln_lora).chunk(3,dim=-1)
-    normed = _fn(x_B_T_H_W_D, block.layer_norm_mlp, sc3, s3)
-    result = block.mlp(normed.to(compute_dtype))
-    x_B_T_H_W_D = x_B_T_H_W_D + rearrange(g3,"b t d -> b t 1 1 d").to(residual_dtype)*result.to(residual_dtype)
-    return x_B_T_H_W_D
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--pairs-path", default=f"{ROOT}/dataset_build/stage4_out/training_pairs_final2.jsonl")
     p.add_argument("--image-dir", default=f"{ROOT}/stage7_train/images_ar")
-    p.add_argument("--output-dir", default=f"{ROOT}/stage7_train/out_ipa")
+    p.add_argument("--output-dir", default=f"{ROOT}/stage7_train/out_ipa_v3")
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-steps", type=int, default=10000)

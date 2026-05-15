@@ -1,49 +1,159 @@
-"""IP-Adapter model for Anima — v4 with AdaLN modulation.
+"""IP-Adapter model for Anima — v3 InstantCharacter-style.
 
-Per-block: VL emb → MLP → per-channel scale/shift, applied after block MLP.
-No pseudo-tokens, no cross-attention — global vector → global modulation.
+Architecture:
+- TimeResampler: SigLIP features → timestep-aware image tokens (AdaLN Perceiver)
+- Per-block IPCrossAttn: RMSNorm on Q/K, full-dim projections
+- Injection: text_attn_out + scale * ip_attn_out
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class BlockModulation(nn.Module):
-    """Maps VL embedding to per-channel scale/shift for one DiT block."""
-
-    def __init__(self, vl_dim=1024, hidden=256, block_dim=2048):
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
         super().__init__()
-        self.proj = nn.Linear(vl_dim, hidden, bias=False)
-        self.mod = nn.Linear(hidden, 2 * block_dim, bias=False)
-        nn.init.normal_(self.proj.weight, std=0.02)
-        nn.init.normal_(self.mod.weight, std=0.001)
+        self.scale = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+        self.dim = dim
 
-    def forward(self, vl_emb):
-        h = F.silu(self.proj(vl_emb))
-        out = self.mod(h)
-        scale, shift = out.chunk(2, dim=-1)
-        return scale, shift
+    def forward(self, x):
+        norm_x = x.norm(2, dim=-1, keepdim=True)
+        rms_x = norm_x * self.dim ** (-1.0 / 2)
+        x_normed = x / (rms_x + self.eps)
+        return self.scale * x_normed
 
 
-class IPAdapter(nn.Module):
-    """IP-Adapter v4: AdaLN modulation from VL embedding.
+class PerceiverAttention(nn.Module):
+    def __init__(self, dim, dim_head=64, heads=16):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = dim_head * heads
+        self.scale = dim_head ** -0.5
 
-    For each of 28 DiT blocks:
-        x = x * (1 + ip_scale * scale) + ip_scale * shift
-    """
+        self.norm_kv = nn.LayerNorm(dim)
+        self.norm_q = nn.LayerNorm(dim)
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-    def __init__(
-        self,
-        vl_dim=768,
-        block_dim=2048,
-        num_blocks=28,
-        modulation_hidden=256,
-    ):
+    def forward(self, x, latents, shift=None, scale=None):
+        x = self.norm_kv(x)
+        latents = self.norm_q(latents)
+        if shift is not None and scale is not None:
+            latents = latents * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        B, L, _ = latents.shape
+        q = self.to_q(latents)
+        kv_input = torch.cat([x, latents], dim=1)
+        k, v = self.to_kv(kv_input).chunk(2, dim=-1)
+        q = q.view(B, L, self.heads, -1).transpose(1, 2)
+        k = k.view(B, k.shape[1], self.heads, -1).transpose(1, 2)
+        v = v.view(B, v.shape[1], self.heads, -1).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, L, -1)
+        return self.to_out(out)
+
+
+class TimeResampler(nn.Module):
+    def __init__(self, input_dim=768, dim=1024, output_dim=2048,
+                 num_queries=32, depth=4, dim_head=64, heads=16,
+                 ff_mult=4, time_embed_dim=320):
+        super().__init__()
+        self.num_queries = num_queries
+        self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim ** 0.5)
+        self.proj_in = nn.Linear(input_dim, dim, bias=False)
+        self.proj_out = nn.Linear(dim, output_dim, bias=False)
+        self.norm_out = nn.LayerNorm(output_dim)
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_embed_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+        self.time_proj = nn.Linear(1, time_embed_dim)
+
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
+                nn.Sequential(
+                    nn.LayerNorm(dim),
+                    nn.Linear(dim, dim * ff_mult, bias=False),
+                    nn.GELU(),
+                    nn.Linear(dim * ff_mult, dim, bias=False),
+                ),
+                nn.Sequential(nn.SiLU(), nn.Linear(dim, 4 * dim, bias=True)),
+            ]))
+
+    def _embed_timestep(self, t):
+        half_dim = self.time_proj.out_features // 2
+        freqs = torch.exp(-math.log(10000) * torch.arange(half_dim, device=t.device, dtype=t.dtype) / half_dim)
+        args = t[:, None].float() * freqs[None]
+        emb = torch.cat([args.cos(), args.sin()], dim=-1)
+        if emb.shape[-1] < self.time_proj.out_features:
+            emb = F.pad(emb, (0, self.time_proj.out_features - emb.shape[-1]))
+        return self.time_mlp(emb)
+
+    def forward(self, x, timestep):
+        B = x.shape[0]
+        x = self.proj_in(x)
+        latents = self.latents.expand(B, -1, -1)
+        temb = self._embed_timestep(timestep)
+        for attn, ff, adaLN_mod in self.layers:
+            shift_msa, scale_msa, shift_ff, scale_ff = adaLN_mod(temb).chunk(4, dim=1)
+            latents = attn(x, latents, shift=shift_msa, scale=scale_msa) + latents
+            res = latents
+            for i, layer in enumerate(ff):
+                latents = layer(latents)
+                if i == 0 and isinstance(layer, nn.LayerNorm):
+                    latents = latents * (1 + scale_ff.unsqueeze(1)) + shift_ff.unsqueeze(1)
+            latents = latents + res
+        return self.norm_out(self.proj_out(latents))
+
+
+class IPCrossAttn(nn.Module):
+    def __init__(self, hidden_size=2048, ip_hidden_dim=2048, num_heads=16):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.norm_ip_q = RMSNorm(self.head_dim, eps=1e-6)
+        self.norm_ip_k = RMSNorm(self.head_dim, eps=1e-6)
+        self.to_k_ip = nn.Linear(ip_hidden_dim, hidden_size, bias=False)
+        self.to_v_ip = nn.Linear(ip_hidden_dim, hidden_size, bias=False)
+
+    def forward(self, q_text, ip_hidden_states):
+        B, S, D = q_text.shape
+        L = ip_hidden_states.shape[1]
+        q = q_text.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.norm_ip_q(q)
+        ip_k = self.to_k_ip(ip_hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        ip_k = self.norm_ip_k(ip_k)
+        ip_v = self.to_v_ip(ip_hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, ip_k, ip_v)
+        out = out.transpose(1, 2).reshape(B, S, D)
+        return out
+
+
+class IPAdapterSigLIP(nn.Module):
+    def __init__(self, input_dim=768, dit_dim=2048, num_blocks=28,
+                 num_queries=32, resampler_depth=4, resampler_heads=16,
+                 resampler_dim=1024, resampler_dim_head=64,
+                 ip_heads=16, time_embed_dim=320):
         super().__init__()
         self.num_blocks = num_blocks
-        self.block_mods = nn.ModuleList([
-            BlockModulation(vl_dim=vl_dim, hidden=modulation_hidden, block_dim=block_dim)
+        self.num_queries = num_queries
+        self.resampler = TimeResampler(
+            input_dim=input_dim, dim=resampler_dim,
+            output_dim=dit_dim, num_queries=num_queries,
+            depth=resampler_depth, dim_head=resampler_dim_head,
+            heads=resampler_heads, ff_mult=4,
+            time_embed_dim=time_embed_dim,
+        )
+        self.ip_cross_attns = nn.ModuleList([
+            IPCrossAttn(hidden_size=dit_dim, ip_hidden_dim=dit_dim, num_heads=ip_heads)
             for _ in range(num_blocks)
         ])
         self.ip_scales = nn.ParameterList([
@@ -51,21 +161,13 @@ class IPAdapter(nn.Module):
             for _ in range(num_blocks)
         ])
 
-    def get_modulation(self, block_idx, vl_emb):
-        """Get (scale, shift) for one DiT block.
+    def encode_ref(self, siglip_features, timestep=None):
+        if timestep is None:
+            B = siglip_features.shape[0]
+            timestep = torch.full((B,), 0.5, device=siglip_features.device, dtype=siglip_features.dtype)
+        return self.resampler(siglip_features, timestep)
 
-        Args:
-            block_idx: DiT block index (0-27)
-            vl_emb: [B, vl_dim] — raw Qwen3-VL embedding
-        Returns:
-            scale: [B, block_dim], shift: [B, block_dim]
-        """
-        if vl_emb.dim() == 3 and vl_emb.shape[1] == 1:
-            vl_emb = vl_emb.squeeze(1)
-        scale, shift = self.block_mods[block_idx](vl_emb)
-        # Normalize: clip scale L2 norm to <= 1.0 so modulation doesn't explode
-        scale_norm = scale.norm(dim=-1, keepdim=True).clamp(min=1.0)
-        scale = scale / scale_norm
-        shift = shift / scale_norm
-        s = self.ip_scales[block_idx]
-        return s * scale, s * shift
+    def forward_block(self, block_idx, query, image_tokens, scale_override=None):
+        ip_out = self.ip_cross_attns[block_idx](query, image_tokens)
+        scale = scale_override if scale_override is not None else self.ip_scales[block_idx]
+        return scale * ip_out
